@@ -368,7 +368,8 @@ fn detect_kimi(content: &str) -> AgentState {
 ///
 /// Working: braille spinner line (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏) + "Thinking..." + "(Press ESC to stop)"
 /// Blocked: EXECUTE prompt with selection box ("Yes, allow" / "No, cancel") +
-///          "Use ↑↓ to navigate, Enter to select"
+///          "Use ↑↓ to navigate, Enter to select", or Ask User prompts with
+///          selection chrome
 /// Idle: prompt box visible, no spinner, no selection prompt
 fn detect_droid(content: &str) -> AgentState {
     let lower = content.to_lowercase();
@@ -386,6 +387,13 @@ fn detect_droid(content: &str) -> AgentState {
     }
     // Secondary: selection chrome + options together (no EXECUTE needed)
     if has_selection_chrome && has_selection_options {
+        return AgentState::Blocked;
+    }
+
+    let has_ask_user = lower.contains("ask user");
+    let has_custom_answer_prompt = lower.contains("or type your own answer");
+
+    if has_ask_user || has_custom_answer_prompt {
         return AgentState::Blocked;
     }
 
@@ -1377,6 +1385,30 @@ mod tests {
     #[test]
     fn droid_waiting_selection_with_chrome() {
         let screen = "│ > Yes, allow │\n│   No, cancel │\n   Use ↑↓ to navigate, Enter to select, Esc to cancel";
+        assert_eq!(detect_droid(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn droid_waiting_ask_user_prompt() {
+        let screen = concat!(
+            "   Ask User\n",
+            "   AAAAA\n",
+            "   BBBBB\n",
+            "   Or type your own answer...\n\n",
+            "   ↑/↓ Navigate • Enter Select • ESC cancel\n",
+        );
+        assert_eq!(detect_droid(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn droid_blocked_on_ask_user_alone() {
+        let screen = "   Ask User\n   What should we do next?";
+        assert_eq!(detect_droid(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn droid_blocked_on_custom_answer_prompt_alone() {
+        let screen = "   Choose an option or type your own answer...";
         assert_eq!(detect_droid(screen), AgentState::Blocked);
     }
 
