@@ -1334,6 +1334,26 @@ impl App {
                     result: ResponseResult::Ok {},
                 }
             }
+            Method::PaneSetDroidSession(params) => {
+                let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+                    return serde_json::to_string(&ErrorResponse {
+                        id: request.id,
+                        error: ErrorBody {
+                            code: "pane_not_found".into(),
+                            message: format!("pane {} not found", params.pane_id),
+                        },
+                    })
+                    .unwrap();
+                };
+                self.handle_internal_event(crate::events::AppEvent::DroidSessionUpdate {
+                    pane_id,
+                    session_id: params.session_id,
+                });
+                SuccessResponse {
+                    id: request.id,
+                    result: ResponseResult::Ok {},
+                }
+            }
             Method::PaneSendText(params) => {
                 let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
                     return serde_json::to_string(&ErrorResponse {

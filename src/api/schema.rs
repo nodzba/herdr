@@ -76,6 +76,8 @@ pub enum Method {
     PaneClearAgentAuthority(PaneClearAgentAuthorityParams),
     #[serde(rename = "pane.release_agent")]
     PaneReleaseAgent(PaneReleaseAgentParams),
+    #[serde(rename = "pane.set_droid_session")]
+    PaneSetDroidSession(PaneSetDroidSessionParams),
     #[serde(rename = "pane.close")]
     PaneClose(PaneTarget),
     #[serde(rename = "events.subscribe")]
@@ -294,6 +296,12 @@ pub struct PaneReleaseAgentParams {
     pub seq: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSetDroidSessionParams {
+    pub pane_id: String,
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadSource {
@@ -398,6 +406,7 @@ pub enum IntegrationTarget {
     Codex,
     Opencode,
     Hermes,
+    Droid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -639,6 +648,8 @@ pub struct PaneInfo {
     pub agent_status: AgentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub droid_session_id: Option<String>,
     pub revision: u64,
 }
 

@@ -270,6 +270,7 @@ impl App {
             agent: terminal.effective_agent_label().map(str::to_string),
             agent_status: pane_agent_status(terminal.state, pane.seen),
             custom_status: terminal.effective_custom_status().map(str::to_string),
+            droid_session_id: terminal.droid_session_id.clone(),
             revision: terminal.revision,
         })
     }

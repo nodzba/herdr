@@ -42,6 +42,8 @@ pub enum AppEvent {
         known_agent: Option<Agent>,
         seq: Option<u64>,
     },
+    /// Droid reported a session ID change (SessionStart or SessionEnd hook).
+    DroidSessionUpdate { pane_id: PaneId, session_id: String },
     /// A new version is available through the active installation manager.
     UpdateReady {
         version: String,

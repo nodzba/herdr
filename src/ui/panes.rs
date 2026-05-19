@@ -273,9 +273,15 @@ pub(super) fn render_panes(app: &AppState, frame: &mut Frame, area: Rect) {
                     .pane_state(info.id)
                     .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
                     .and_then(|terminal| {
-                        terminal.border_label(app.show_agent_labels_on_pane_borders)
+                        let label = terminal.border_label(app.show_agent_labels_on_pane_borders)?;
+                        if let Some(ref sid) = terminal.droid_session_id {
+                            let short: String = sid.chars().take(8).collect();
+                            Some(format!("{label} {short}"))
+                        } else {
+                            Some(label.to_string())
+                        }
                     })
-                    .and_then(|label| pane_border_title(label, info.rect.width))
+                    .and_then(|label| pane_border_title(&label, info.rect.width))
                 {
                     block = block.title(Line::from(Span::styled(title, border_style)));
                 }

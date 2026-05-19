@@ -18,6 +18,7 @@ pub struct PaneDetail {
     pub state: AgentState,
     pub seen: bool,
     pub custom_status: Option<String>,
+    pub droid_session_id: Option<String>,
 }
 
 impl Tab {
@@ -51,6 +52,7 @@ impl Tab {
                     state: terminal.state,
                     seen: pane.seen,
                     custom_status: terminal.effective_custom_status().map(str::to_string),
+                    droid_session_id: terminal.droid_session_id.clone(),
                 })
             })
             .collect()

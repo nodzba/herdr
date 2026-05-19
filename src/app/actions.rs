@@ -829,6 +829,20 @@ impl AppState {
                 })
                 .into_iter()
                 .collect(),
+            AppEvent::DroidSessionUpdate {
+                pane_id,
+                session_id,
+            } => {
+                self.update_terminal_state(pane_id, |terminal| {
+                    if session_id.is_empty() {
+                        terminal.clear_droid_session_id();
+                    } else {
+                        terminal.set_droid_session_id(session_id.clone());
+                    }
+                    None
+                });
+                Vec::new()
+            }
             // Intercepted in App::handle_internal_event before reaching this
             // dispatch; never touches AppState.
             AppEvent::ClipboardWrite { .. } => Vec::new(),

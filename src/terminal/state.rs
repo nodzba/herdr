@@ -39,6 +39,7 @@ pub struct TerminalState {
     pub hook_authority: Option<HookAuthority>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
+    pub droid_session_id: Option<String>,
     hook_report_sequences: HashMap<String, u64>,
     pub state: AgentState,
     pub revision: u64,
@@ -55,6 +56,7 @@ impl TerminalState {
             hook_authority: None,
             manual_label: None,
             agent_name: None,
+            droid_session_id: None,
             hook_report_sequences: HashMap::new(),
             state: AgentState::Unknown,
             revision: 0,
@@ -263,6 +265,15 @@ impl TerminalState {
 
     pub fn clear_agent_name(&mut self) {
         self.agent_name = None;
+    }
+
+    pub fn set_droid_session_id(&mut self, session_id: String) {
+        let id = session_id.trim().to_string();
+        self.droid_session_id = (!id.is_empty()).then_some(id);
+    }
+
+    pub fn clear_droid_session_id(&mut self) {
+        self.droid_session_id = None;
     }
 
     pub fn is_agent_terminal(&self) -> bool {

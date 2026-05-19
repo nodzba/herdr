@@ -31,6 +31,9 @@ const HERMES_PLUGIN_INIT_INSTALL_NAME: &str = "__init__.py";
 const HERMES_PLUGIN_MANIFEST_ASSET: &str = include_str!("assets/hermes/plugin.yaml");
 const HERMES_PLUGIN_INIT_ASSET: &str = include_str!("assets/hermes/__init__.py");
 const HERMES_INTEGRATION_VERSION: u32 = 1;
+const DROID_HOOK_INSTALL_NAME: &str = "herdr-droid-session.sh";
+const DROID_HOOK_ASSET: &str = include_str!("assets/droid/herdr-droid-session.sh");
+const DROID_INTEGRATION_VERSION: u32 = 1;
 const INTEGRATION_VERSION_MARKER: &str = "HERDR_INTEGRATION_VERSION=";
 
 #[derive(Debug)]
@@ -110,6 +113,20 @@ pub(crate) struct HermesUninstallResult {
     pub updated_config: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct DroidInstallResult {
+    pub hook_path: PathBuf,
+    pub settings_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct DroidUninstallResult {
+    pub hook_path: PathBuf,
+    pub settings_path: PathBuf,
+    pub removed_hook_file: bool,
+    pub updated_settings: bool,
+}
+
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
     cmd.env(HERDR_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
@@ -167,6 +184,19 @@ pub(crate) fn install_target(
                 format!(
                     "enabled hermes plugin in {}",
                     installed.config_path.display()
+                ),
+            ]
+        }
+        crate::api::schema::IntegrationTarget::Droid => {
+            let installed = install_droid()?;
+            vec![
+                format!(
+                    "installed droid integration hook to {}",
+                    installed.hook_path.display()
+                ),
+                format!(
+                    "ensured droid settings at {}",
+                    installed.settings_path.display()
                 ),
             ]
         }
@@ -293,6 +323,33 @@ pub(crate) fn uninstall_target(
             }
             messages
         }
+        crate::api::schema::IntegrationTarget::Droid => {
+            let result = uninstall_droid()?;
+            let mut messages = Vec::new();
+            if result.removed_hook_file {
+                messages.push(format!(
+                    "removed droid hook at {}",
+                    result.hook_path.display()
+                ));
+            } else {
+                messages.push(format!(
+                    "no droid hook found at {}",
+                    result.hook_path.display()
+                ));
+            }
+            if result.updated_settings {
+                messages.push(format!(
+                    "removed herdr droid hook entries from {}",
+                    result.settings_path.display()
+                ));
+            } else {
+                messages.push(format!(
+                    "no herdr droid hook entries found in {}",
+                    result.settings_path.display()
+                ));
+            }
+            messages
+        }
     };
 
     crate::logging::integration_action("uninstall", integration_target_label(target), "ok");
@@ -308,6 +365,7 @@ pub(crate) fn integration_target_label(
         crate::api::schema::IntegrationTarget::Codex => "codex",
         crate::api::schema::IntegrationTarget::Opencode => "opencode",
         crate::api::schema::IntegrationTarget::Hermes => "hermes",
+        crate::api::schema::IntegrationTarget::Droid => "droid",
     }
 }
 
@@ -331,7 +389,7 @@ fn integration_specs() -> [(
     crate::api::schema::IntegrationTarget,
     io::Result<PathBuf>,
     u32,
-); 5] {
+); 6] {
     [
         (
             crate::api::schema::IntegrationTarget::Pi,
@@ -357,6 +415,11 @@ fn integration_specs() -> [(
             crate::api::schema::IntegrationTarget::Hermes,
             hermes_plugin_dir().map(|dir| dir.join(HERMES_PLUGIN_INIT_INSTALL_NAME)),
             HERMES_INTEGRATION_VERSION,
+        ),
+        (
+            crate::api::schema::IntegrationTarget::Droid,
+            droid_dir().map(|dir| dir.join(DROID_HOOK_INSTALL_NAME)),
+            DROID_INTEGRATION_VERSION,
         ),
     ]
 }
@@ -867,6 +930,138 @@ pub(crate) fn uninstall_hermes() -> io::Result<HermesUninstallResult> {
         removed_plugin_dir,
         updated_config,
     })
+}
+
+pub(crate) fn droid_dir() -> io::Result<PathBuf> {
+    let home = home_dir()?;
+    Ok(home.join(".factory").join("hooks"))
+}
+
+pub(crate) fn install_droid() -> io::Result<DroidInstallResult> {
+    let hooks_dir = droid_dir()?;
+    fs::create_dir_all(&hooks_dir)?;
+
+    let hook_path = hooks_dir.join(DROID_HOOK_INSTALL_NAME);
+    fs::write(&hook_path, DROID_HOOK_ASSET)?;
+    make_executable(&hook_path)?;
+
+    let factory_dir = hooks_dir
+        .parent()
+        .expect("hooks dir is always inside .factory");
+    let settings_path = factory_dir.join("settings.json");
+
+    let mut settings = if settings_path.is_file() {
+        serde_json::from_str::<Value>(&fs::read_to_string(&settings_path)?).map_err(|err| {
+            io::Error::other(format!(
+                "failed to parse {}: {err}",
+                settings_path.display()
+            ))
+        })?
+    } else {
+        json!({})
+    };
+
+    let root = settings
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("settings.json must be a JSON object"))?;
+
+    let hook_path_str = hook_path.to_string_lossy().to_string();
+
+    for hook_name in &["SessionStart", "SessionEnd"] {
+        let hooks_arr = root
+            .entry(String::from(*hook_name))
+            .or_insert_with(|| Value::Array(vec![]));
+        let hooks_list = hooks_arr
+            .as_array_mut()
+            .ok_or_else(|| io::Error::other(format!("{hook_name} must be a JSON array")))?;
+
+        let already_installed = hooks_list.iter().any(|entry| {
+            entry.as_object().is_some_and(|o| {
+                o.get("command")
+                    .is_some_and(|c| c.as_str() == Some(&hook_path_str))
+            })
+        });
+
+        if !already_installed {
+            let herdr_entry = Value::Object({
+                let mut obj = Map::new();
+                obj.insert("command".into(), Value::String(hook_path_str.clone()));
+                obj.insert(
+                    "args".into(),
+                    Value::Array(vec![Value::String(hook_name.to_string())]),
+                );
+                obj
+            });
+            hooks_list.push(herdr_entry);
+        }
+    }
+
+    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+
+    Ok(DroidInstallResult {
+        hook_path,
+        settings_path,
+    })
+}
+
+pub(crate) fn uninstall_droid() -> io::Result<DroidUninstallResult> {
+    let hooks_dir = droid_dir()?;
+    let hook_path = hooks_dir.join(DROID_HOOK_INSTALL_NAME);
+    let removed_hook_file = remove_file_if_exists(&hook_path)?;
+
+    let settings_path = hooks_dir
+        .parent()
+        .expect("hooks dir is always inside .factory")
+        .join("settings.json");
+    let updated_settings = remove_droid_settings_entries(&settings_path, &hook_path)?;
+
+    Ok(DroidUninstallResult {
+        hook_path,
+        settings_path,
+        removed_hook_file,
+        updated_settings,
+    })
+}
+
+fn remove_droid_settings_entries(settings_path: &Path, hook_path: &Path) -> io::Result<bool> {
+    if !settings_path.exists() {
+        return Ok(false);
+    }
+    let mut settings =
+        serde_json::from_str::<Value>(&fs::read_to_string(settings_path)?).map_err(|err| {
+            io::Error::other(format!(
+                "failed to parse {}: {err}",
+                settings_path.display()
+            ))
+        })?;
+    let root = settings
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("settings.json must be a JSON object"))?;
+
+    let hook_path_str = hook_path.to_string_lossy().to_string();
+    let mut updated = false;
+
+    for hook_name in &["SessionStart", "SessionEnd"] {
+        if let Some(hooks_arr) = root.get_mut(*hook_name) {
+            if let Some(list) = hooks_arr.as_array_mut() {
+                let before_len = list.len();
+                list.retain(|entry| {
+                    !entry.as_object().is_some_and(|o| {
+                        o.get("command")
+                            .is_some_and(|c| c.as_str() == Some(&hook_path_str))
+                    })
+                });
+                if list.len() != before_len {
+                    updated = true;
+                }
+            }
+        }
+    }
+
+    if updated {
+        fs::write(settings_path, serde_json::to_string_pretty(&settings)?)?;
+    }
+    Ok(updated)
 }
 
 fn ensure_hooks_object<'a>(

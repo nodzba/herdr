@@ -25,6 +25,7 @@ pub(crate) struct AgentPanelEntry {
     pub state: AgentState,
     pub seen: bool,
     pub custom_status: Option<String>,
+    pub droid_session_id: Option<String>,
 }
 
 fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
@@ -128,6 +129,7 @@ pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                     state: detail.state,
                     seen: detail.seen,
                     custom_status: detail.custom_status,
+                    droid_session_id: detail.droid_session_id,
                 })
                 .collect()
         }
@@ -150,6 +152,7 @@ pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                         state: detail.state,
                         seen: detail.seen,
                         custom_status: detail.custom_status,
+                        droid_session_id: detail.droid_session_id,
                     })
             })
             .collect(),
@@ -842,6 +845,11 @@ fn render_agent_detail(app: &AppState, frame: &mut Frame, area: Rect) {
             status_spans.push(Span::styled(" · ", agent_style));
             status_spans.push(Span::styled(agent_label, agent_style));
         }
+        if let Some(session_id) = &detail.droid_session_id {
+            let short: String = session_id.chars().take(8).collect();
+            status_spans.push(Span::styled(" ", agent_style));
+            status_spans.push(Span::styled(short, agent_style));
+        }
         if let Some(custom_status) = &detail.custom_status {
             status_spans.push(Span::styled(" · ", agent_style));
             status_spans.push(Span::styled(custom_status.clone(), agent_style));
@@ -977,6 +985,7 @@ mod tests {
             state: AgentState::Idle,
             seen: true,
             custom_status: None,
+            droid_session_id: None,
         };
 
         let label = format_agent_panel_primary_label(&entry, 18);

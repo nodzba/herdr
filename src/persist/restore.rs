@@ -173,18 +173,63 @@ fn restore_tab(
             .get(id)
             .and_then(|old_id| snap.panes.get(old_id))
             .and_then(|p| p.agent_name.clone());
+        let saved_droid_session_id = reverse_id_map
+            .get(id)
+            .and_then(|old_id| snap.panes.get(old_id))
+            .and_then(|p| p.droid_session_id.clone());
 
-        match TerminalRuntime::spawn(
-            *id,
-            rows,
-            cols,
-            cwd.clone(),
-            scrollback_limit_bytes,
-            crate::terminal_theme::TerminalTheme::default(),
-            events.clone(),
-            render_notify.clone(),
-            render_dirty.clone(),
-        ) {
+        let runtime_result = if let Some(ref session_id) = saved_droid_session_id {
+            let session_file = droid_session_jsonl_path(&cwd, session_id);
+            if session_file.is_file() {
+                let argv = vec![
+                    "droid".to_string(),
+                    "--resume".to_string(),
+                    session_id.clone(),
+                ];
+                TerminalRuntime::spawn_argv_command(
+                    *id,
+                    rows,
+                    cols,
+                    cwd.clone(),
+                    &argv,
+                    scrollback_limit_bytes,
+                    crate::terminal_theme::TerminalTheme::default(),
+                    events.clone(),
+                    render_notify.clone(),
+                    render_dirty.clone(),
+                )
+            } else {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "droid session file not found, spawning fresh shell"
+                );
+                TerminalRuntime::spawn(
+                    *id,
+                    rows,
+                    cols,
+                    cwd.clone(),
+                    scrollback_limit_bytes,
+                    crate::terminal_theme::TerminalTheme::default(),
+                    events.clone(),
+                    render_notify.clone(),
+                    render_dirty.clone(),
+                )
+            }
+        } else {
+            TerminalRuntime::spawn(
+                *id,
+                rows,
+                cols,
+                cwd.clone(),
+                scrollback_limit_bytes,
+                crate::terminal_theme::TerminalTheme::default(),
+                events.clone(),
+                render_notify.clone(),
+                render_dirty.clone(),
+            )
+        };
+
+        match runtime_result {
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
@@ -193,6 +238,9 @@ fn restore_tab(
                 }
                 if let Some(agent_name) = saved_agent_name {
                     terminal.set_agent_name(agent_name);
+                }
+                if let Some(session_id) = saved_droid_session_id {
+                    terminal.set_droid_session_id(session_id);
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -337,6 +385,23 @@ fn collect_ids_inner(node: &Node, ids: &mut Vec<PaneId>) {
             collect_ids_inner(second, ids);
         }
     }
+}
+
+/// Compute the path to a Droid session `.jsonl` file given the pane cwd and session ID.
+/// Droid stores sessions at `~/.factory/sessions/<dir-key>/<session-id>.jsonl`
+/// where `<dir-key>` is the cwd with `/` replaced by `-`.
+fn droid_session_jsonl_path(cwd: &std::path::Path, session_id: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    let cwd_str = cwd.display().to_string();
+    let dir_key = if cwd_str.starts_with('/') {
+        format!("-{}", cwd_str[1..].replace('/', "-"))
+    } else {
+        cwd_str.replace('/', "-")
+    };
+    std::path::PathBuf::from(home)
+        .join(".factory/sessions")
+        .join(dir_key)
+        .join(format!("{}.jsonl", session_id))
 }
 
 #[cfg(test)]
