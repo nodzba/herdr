@@ -374,6 +374,15 @@ fn detect_kimi(content: &str) -> AgentState {
 fn detect_droid(content: &str) -> AgentState {
     let lower = content.to_lowercase();
 
+    // Working checks first: braille spinner + "ESC to stop" is a strong
+    // signal that the agent is actively working, even if stale "Ask User"
+    // text from a previous prompt is still visible in the detection window.
+    // No standalone "ESC to stop" fallback — the phrase can appear in
+    // response content (e.g. explaining the fix), causing false Working.
+    if has_braille_spinner(content) && lower.contains("esc to stop") {
+        return AgentState::Working;
+    }
+
     // Blocked: EXECUTE approval prompt with selection UI chrome
     // Primary (AND): structural keyword + chrome text = certain
     let has_execute = content.contains("EXECUTE");
@@ -395,16 +404,6 @@ fn detect_droid(content: &str) -> AgentState {
 
     if has_ask_user || has_custom_answer_prompt {
         return AgentState::Blocked;
-    }
-
-    // Working: braille spinner character at start of a line + "Thinking..."
-    // The braille chars (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏) are very specific — won't appear in normal content
-    if has_braille_spinner(content) && lower.contains("esc to stop") {
-        return AgentState::Working;
-    }
-    // Fallback: "ESC to stop" alone is still a strong signal (it's UI chrome)
-    if lower.contains("esc to stop") {
-        return AgentState::Working;
     }
 
     AgentState::Idle
@@ -1361,10 +1360,11 @@ mod tests {
     }
 
     #[test]
-    fn droid_working_esc_to_stop_alone() {
-        // ESC to stop without spinner is still working (UI chrome)
+    fn droid_working_esc_to_stop_needs_spinner() {
+        // ESC to stop without spinner is NOT working — the phrase can
+        // appear in response content, causing false positives.
         let screen = "Processing\n(Press ESC to stop)";
-        assert_eq!(detect_droid(screen), AgentState::Working);
+        assert_eq!(detect_droid(screen), AgentState::Idle);
     }
 
     #[test]
@@ -1410,6 +1410,14 @@ mod tests {
     fn droid_blocked_on_custom_answer_prompt_alone() {
         let screen = "   Choose an option or type your own answer...";
         assert_eq!(detect_droid(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn droid_working_overrides_stale_ask_user() {
+        // When braille spinner + ESC to stop appears, working wins even if
+        // stale "Ask User" text is still in the detection window.
+        let screen = "   Ask User\n   What should we do next?\n⠋ Streaming...  (Press ESC to stop)\n";
+        assert_eq!(detect_droid(screen), AgentState::Working);
     }
 
     #[test]

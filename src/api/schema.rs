@@ -1137,6 +1137,7 @@ mod tests {
                     agent: None,
                     agent_status: AgentStatus::Unknown,
                     custom_status: None,
+                    droid_session_id: None,
                     revision: 0,
                 },
             },

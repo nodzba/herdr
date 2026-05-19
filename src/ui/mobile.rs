@@ -919,6 +919,7 @@ mod tests {
             state: AgentState::Idle,
             seen: true,
             custom_status: None,
+            droid_session_id: None,
         }
     }
 

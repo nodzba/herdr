@@ -450,6 +450,7 @@ mod tests {
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
                 label: None,
                 agent_name: None,
+                droid_session_id: None,
             },
         );
         panes.insert(
@@ -458,6 +459,7 @@ mod tests {
                 cwd: PathBuf::from("/home/can/Projects/website"),
                 label: Some("website".into()),
                 agent_name: None,
+                droid_session_id: None,
             },
         );
 
@@ -772,6 +774,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
                 label: None,
                 agent_name: None,
+                droid_session_id: None,
             },
         );
         panes.insert(
@@ -782,6 +785,7 @@ mod tests {
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),
                 label: None,
                 agent_name: None,
+                droid_session_id: None,
             },
         );
 
