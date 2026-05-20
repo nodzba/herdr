@@ -35,6 +35,7 @@ mod logging;
 mod pane;
 mod persist;
 mod platform;
+mod product_announcements;
 mod raw_input;
 mod release_notes;
 mod remote;
@@ -73,6 +74,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # accent = "#f5c2e7"
 # red = "#ff6188"
 # green = "#a6e3a1"
+
+[terminal]
+# Executable used for new interactive panes.
+# Empty means $SHELL, then /bin/sh.
+# default_shell = ""
 
 [keys]
 # Prefix key to enter navigate mode (default: "ctrl+b")
@@ -516,13 +522,10 @@ fn main() -> io::Result<()> {
             std::io::stdout().flush()?;
         }
 
-        let startup_release_notes = crate::release_notes::load_pending_for_current_version();
-
         let mut app = app::App::new(
             config,
             true, // no_session — monolithic mode never saves/restores sessions
             config_diagnostic,
-            startup_release_notes,
             api_rx,
             event_hub,
         );

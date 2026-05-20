@@ -1631,7 +1631,7 @@ fn parse_integration_target(
         return Ok(None);
     };
     if args.len() != 1 {
-        eprintln!("usage: herdr integration {action} <pi|claude|codex|opencode|hermes>");
+        eprintln!("usage: herdr integration {action} <pi|claude|codex|opencode|hermes|droid>");
         return Ok(None);
     }
 
@@ -1641,9 +1641,10 @@ fn parse_integration_target(
         "codex" => IntegrationTarget::Codex,
         "opencode" => IntegrationTarget::Opencode,
         "hermes" => IntegrationTarget::Hermes,
+        "droid" => IntegrationTarget::Droid,
         _ => {
             eprintln!("unknown integration target: {target}");
-            eprintln!("currently supported: pi, claude, codex, opencode, hermes");
+            eprintln!("currently supported: pi, claude, codex, opencode, hermes, droid");
             return Ok(None);
         }
     };
@@ -2151,6 +2152,7 @@ fn print_integration_help() {
     eprintln!("  herdr integration uninstall claude");
     eprintln!("  herdr integration uninstall codex");
     eprintln!("  herdr integration uninstall opencode");
+    eprintln!("  herdr integration uninstall hermes");
     eprintln!("  herdr integration status [--outdated-only]");
 }
 

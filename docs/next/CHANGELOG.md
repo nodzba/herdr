@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added
+- Added an integrations tab in settings and first-run onboarding so users can install recommended agent integrations from inside Herdr.
+- Added `terminal.default_shell` to choose the executable used for new interactive panes. When unset, Herdr still falls back to `$SHELL`, then `/bin/sh`. (#196)
+- Added native Kiro CLI detection with idle and working state heuristics. (#185)
+
+### Fixed
+- Remote clients now bridge local clipboard images into the remote pane by staging them as temporary image files and pasting the remote path, so Claude Code image paste works over `herdr --remote`. (#205)
+
+### Breaking Changes
+- The client/server protocol is now version 8. Stop and restart any running v0.5.12 server before attaching with this release.
+
+## [0.5.12] - 2026-05-19
+
+### Fixed
+- The Claude Code integration no longer reports successful or failed post-tool hooks as `working`, and installing the updated integration removes Herdr's deprecated post-tool hook entries from existing Claude settings. (#198)
+- The Codex integration now reports native `PermissionRequest` hooks as `blocked`, so permission prompts no longer stay pinned as `working` after a tool-use hook. (#198)
+- Workspace and tab rename prompts now handle Backspace, Ctrl+Backspace, Alt+Backspace, Cmd+Backspace, Ctrl+H, Ctrl+W, and Ctrl+U as editing shortcuts instead of inserting stray characters or clearing unexpectedly. (#204)
+
 ## [0.5.11] - 2026-05-19
 
 ### Added
