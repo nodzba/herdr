@@ -2,7 +2,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 
 use crate::{
-    app::state::{key_matches, AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode},
+    app::state::{
+        AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode, NavigatorStateFilter,
+    },
+    input::TerminalKey,
     layout::NavDirection,
 };
 
@@ -66,7 +69,7 @@ pub(super) fn modal_action_from_buttons<A: Copy>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GlobalMenuAction {
-    Quit,
+    Detach,
     WhatsNew,
     Keybinds,
     ReloadConfig,
@@ -82,7 +85,7 @@ pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
     if state.update_available.is_some() || state.latest_release_notes_available {
         actions.push(GlobalMenuAction::WhatsNew);
     }
-    actions.push(GlobalMenuAction::Quit);
+    actions.push(GlobalMenuAction::Detach);
     actions
 }
 
@@ -110,19 +113,19 @@ fn open_update_release_notes(state: &mut AppState) {
     state.mode = Mode::ReleaseNotes;
 }
 
-pub(super) fn request_quit_or_detach(state: &mut AppState) {
-    if state.quit_detaches {
-        state.detach_requested = true;
-    } else {
+pub(super) fn request_detach(state: &mut AppState) {
+    if state.detach_exits {
         state.should_quit = true;
+    } else {
+        state.detach_requested = true;
     }
 }
 
 pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuAction) {
     match action {
-        GlobalMenuAction::Quit => {
+        GlobalMenuAction::Detach => {
             leave_modal(state);
-            request_quit_or_detach(state);
+            request_detach(state);
         }
         GlobalMenuAction::WhatsNew => open_update_release_notes(state),
         GlobalMenuAction::Keybinds => open_keybind_help(state),
@@ -149,6 +152,121 @@ pub(crate) fn handle_global_menu_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
+pub(crate) fn handle_navigator_key(state: &mut AppState, key: KeyEvent) {
+    if state.navigator.search_focused {
+        match key.code {
+            KeyCode::Esc => {
+                if state.navigator.query.is_empty() {
+                    state.navigator.search_focused = false;
+                    leave_modal(state);
+                } else {
+                    state.navigator.query.clear();
+                    state.navigator.state_filter = None;
+                    state.navigator.search_focused = false;
+                    state.clamp_navigator_selection();
+                }
+            }
+            KeyCode::Enter => {
+                state.accept_navigator_selection();
+            }
+            KeyCode::Backspace => {
+                state.navigator.state_filter = None;
+                state.navigator.query.pop();
+                state.clamp_navigator_selection();
+            }
+            KeyCode::Up => state.move_navigator_selection(-1),
+            KeyCode::Down => state.move_navigator_selection(1),
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+                state.move_navigator_selection(1)
+            }
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                state.move_navigator_selection(-1)
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                state.navigator.query.clear();
+                state.navigator.state_filter = None;
+                state.clamp_navigator_selection();
+            }
+            KeyCode::Char(c)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                state.navigator.state_filter = None;
+                state.navigator.query.push(c);
+                state.clamp_navigator_selection();
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            if state.navigator.query.is_empty() && state.navigator.state_filter.is_none() {
+                leave_modal(state);
+            } else {
+                state.navigator.query.clear();
+                state.navigator.state_filter = None;
+                state.clamp_navigator_selection();
+            }
+        }
+        KeyCode::Enter => {
+            state.accept_navigator_selection();
+        }
+        KeyCode::Char('/') => {
+            state.navigator.query.clear();
+            state.navigator.state_filter = None;
+            state.navigator.search_focused = true;
+            state.clamp_navigator_selection();
+        }
+        KeyCode::Backspace if state.navigator.state_filter.is_some() => {
+            state.navigator.state_filter = None;
+            state.clamp_navigator_selection();
+        }
+        KeyCode::Char('a') if key.modifiers.is_empty() => {
+            state.navigator.query.clear();
+            state.navigator.state_filter = None;
+            state.clamp_navigator_selection();
+        }
+        KeyCode::Char('b') if key.modifiers.is_empty() => {
+            state.navigator.query.clear();
+            state.navigator.state_filter = Some(NavigatorStateFilter::Blocked);
+            state.clamp_navigator_selection();
+        }
+        KeyCode::Char('w') if key.modifiers.is_empty() => {
+            state.navigator.query.clear();
+            state.navigator.state_filter = Some(NavigatorStateFilter::Working);
+            state.clamp_navigator_selection();
+        }
+        KeyCode::Char('i') if key.modifiers.is_empty() => {
+            state.navigator.query.clear();
+            state.navigator.state_filter = Some(NavigatorStateFilter::Idle);
+            state.clamp_navigator_selection();
+        }
+        KeyCode::Char('d') if key.modifiers.is_empty() => {
+            state.navigator.query.clear();
+            state.navigator.state_filter = Some(NavigatorStateFilter::Done);
+            state.clamp_navigator_selection();
+        }
+        KeyCode::Char('j') | KeyCode::Down => state.move_navigator_selection(1),
+        KeyCode::Char('k') | KeyCode::Up => state.move_navigator_selection(-1),
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+            state.move_navigator_selection((state.navigator_body_rect().height / 2).max(1) as isize)
+        }
+        KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => state
+            .move_navigator_selection(-((state.navigator_body_rect().height / 2).max(1) as isize)),
+        KeyCode::Char(' ') => state.toggle_selected_navigator_workspace(),
+        KeyCode::Home => {
+            state.navigator.selected = 0;
+            state.ensure_navigator_selection_visible();
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            state.navigator.selected = state.navigator_rows().len().saturating_sub(1);
+            state.ensure_navigator_selection_visible();
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn handle_keybind_help_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => state.scroll_keybind_help(-1),
@@ -162,10 +280,15 @@ pub(crate) fn handle_keybind_help_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-pub(super) fn open_rename_workspace(state: &mut AppState, ws_idx: usize) {
+pub(super) fn open_rename_workspace(
+    state: &mut AppState,
+    terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ws_idx: usize,
+) {
     state.selected = ws_idx;
     state.rename_pane_target = None;
-    state.name_input = state.workspaces[ws_idx].display_name();
+    state.name_input =
+        state.workspaces[ws_idx].display_name_from(&state.terminals, terminal_runtimes);
     state.name_input_replace_on_type = false;
     state.mode = Mode::RenameWorkspace;
 }
@@ -448,14 +571,12 @@ pub(crate) fn handle_rename_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-pub(crate) fn handle_resize_key(state: &mut AppState, key: KeyEvent) {
+pub(crate) fn handle_resize_key(state: &mut AppState, raw_key: TerminalKey) {
+    let key = raw_key.as_key_event();
     if key.code == KeyCode::Esc
         || key.code == KeyCode::Enter
-        || key_matches(
-            &key,
-            state.keybinds.resize_mode.0,
-            state.keybinds.resize_mode.1,
-        )
+        || state.keybinds.resize_mode.matches_prefix_key(raw_key)
+        || state.keybinds.resize_mode.matches_direct_key(raw_key)
     {
         if state.active.is_some() {
             state.mode = Mode::Terminal;
@@ -499,13 +620,57 @@ pub(crate) fn handle_confirm_close_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-pub(super) fn apply_context_menu_action(state: &mut AppState, menu: ContextMenuState, idx: usize) {
+pub(super) fn apply_context_menu_action(
+    state: &mut AppState,
+    terminal_runtimes: &mut crate::terminal::TerminalRuntimeRegistry,
+    menu: ContextMenuState,
+    idx: usize,
+) {
     let item = menu.items().get(idx).copied();
     match (menu.kind, item) {
-        (ContextMenuKind::Workspace { ws_idx }, Some("Rename")) => {
-            open_rename_workspace(state, ws_idx);
+        (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
+            state.request_new_linked_worktree = Some(ws_idx);
+            leave_modal(state);
         }
-        (ContextMenuKind::Workspace { ws_idx }, Some("Close")) => {
+        (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Delete worktree checkout...")) => {
+            state.request_remove_linked_worktree = Some(ws_idx);
+            leave_modal(state);
+        }
+        (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Open worktree...")) => {
+            state.request_open_existing_worktree = Some(ws_idx);
+            leave_modal(state);
+        }
+        (
+            ContextMenuKind::GitWorkspace {
+                ws_idx, collapsed, ..
+            },
+            Some("Collapse" | "Expand"),
+        ) => {
+            if let Some(key) = state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.worktree_space())
+                .map(|space| space.key.clone())
+            {
+                if collapsed {
+                    state.collapsed_space_keys.remove(&key);
+                } else {
+                    state.collapsed_space_keys.insert(key);
+                }
+                state.mark_session_dirty();
+            }
+            leave_modal(state);
+        }
+        (
+            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Rename"),
+        ) => {
+            open_rename_workspace(state, terminal_runtimes, ws_idx);
+        }
+        (
+            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Close" | "Close group"),
+        ) => {
             state.selected = ws_idx;
             if state.confirm_close {
                 open_confirm_close(state);
@@ -530,12 +695,13 @@ pub(super) fn apply_context_menu_action(state: &mut AppState, menu: ContextMenuS
             state.selected = ws_idx;
             state.active = Some(ws_idx);
             state.switch_tab(tab_idx);
-            state.close_tab();
-            state.mode = if state.active.is_some() {
-                Mode::Terminal
-            } else {
-                Mode::Navigate
-            };
+            if !state.close_tab() {
+                state.mode = if state.active.is_some() {
+                    Mode::Terminal
+                } else {
+                    Mode::Navigate
+                };
+            }
         }
         (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
             open_rename_pane(state, pane_id);
@@ -555,11 +721,11 @@ pub(super) fn apply_context_menu_action(state: &mut AppState, menu: ContextMenuS
             state.mode = Mode::Terminal;
         }
         (ContextMenuKind::Pane { .. }, Some("Split vertical")) => {
-            state.split_pane(Direction::Horizontal);
+            state.split_pane(terminal_runtimes, Direction::Horizontal);
             state.mode = Mode::Terminal;
         }
         (ContextMenuKind::Pane { .. }, Some("Split horizontal")) => {
-            state.split_pane(Direction::Vertical);
+            state.split_pane(terminal_runtimes, Direction::Vertical);
             state.mode = Mode::Terminal;
         }
         (ContextMenuKind::Pane { .. }, Some("Zoom")) => {
@@ -567,18 +733,23 @@ pub(super) fn apply_context_menu_action(state: &mut AppState, menu: ContextMenuS
             state.mode = Mode::Terminal;
         }
         (ContextMenuKind::Pane { .. }, Some("Close pane")) => {
-            state.close_pane();
-            state.mode = if state.active.is_some() {
-                Mode::Terminal
-            } else {
-                Mode::Navigate
-            };
+            if !state.close_pane() {
+                state.mode = if state.active.is_some() {
+                    Mode::Terminal
+                } else {
+                    Mode::Navigate
+                };
+            }
         }
         _ => leave_modal(state),
     }
 }
 
-pub(crate) fn handle_context_menu_key(state: &mut AppState, key: KeyEvent) {
+pub(crate) fn handle_context_menu_key(
+    state: &mut AppState,
+    terminal_runtimes: &mut crate::terminal::TerminalRuntimeRegistry,
+    key: KeyEvent,
+) {
     match key.code {
         KeyCode::Esc => {
             state.context_menu = None;
@@ -597,7 +768,7 @@ pub(crate) fn handle_context_menu_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Enter => {
             if let Some(menu) = state.context_menu.take() {
                 let idx = menu.list.highlighted;
-                apply_context_menu_action(state, menu, idx);
+                apply_context_menu_action(state, terminal_runtimes, menu, idx);
             }
         }
         _ => {}
@@ -628,8 +799,7 @@ mod tests {
     use super::*;
 
     fn config_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        crate::config::test_config_env_lock()
     }
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
@@ -648,15 +818,68 @@ mod tests {
     fn custom_resize_key_exits_resize_mode() {
         let mut state = state_with_workspaces(&["test"]);
         state.mode = Mode::Resize;
-        state.keybinds.resize_mode = (KeyCode::Char('g'), KeyModifiers::empty());
-        state.keybinds.resize_mode_label = "g".into();
+        state.keybinds.resize_mode = crate::config::ActionKeybinds::prefix("g");
 
         handle_resize_key(
             &mut state,
-            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()),
+            TerminalKey::new(KeyCode::Char('g'), KeyModifiers::empty()),
         );
 
         assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn direct_resize_key_exits_resize_mode() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::Resize;
+        state.keybinds.resize_mode = crate::config::ActionKeybinds::direct("ctrl+alt+r");
+
+        handle_resize_key(
+            &mut state,
+            TerminalKey::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        );
+
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn resize_key_exit_matches_enhanced_shifted_punctuation() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::Resize;
+        state.keybinds.resize_mode = crate::config::ActionKeybinds::prefix("?");
+
+        handle_resize_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Char('/'), KeyModifiers::SHIFT)
+                .with_shifted_codepoint('?' as u32),
+        );
+
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn detach_requests_client_detach_in_persistence_mode() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.detach_exits = false;
+
+        request_detach(&mut state);
+
+        assert!(state.detach_requested);
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn detach_exits_in_no_session_mode() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.detach_exits = true;
+
+        request_detach(&mut state);
+
+        assert!(state.should_quit);
+        assert!(!state.detach_requested);
     }
 
     #[test]
@@ -971,5 +1194,110 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
         );
         assert_eq!(state.workspaces.len(), 1);
+    }
+
+    #[test]
+    fn confirm_close_for_linked_worktree_closes_workspace_only() {
+        let mut state = state_with_workspaces(&["main", "issue"]);
+        state.mode = Mode::ConfirmClose;
+        state.selected = 1;
+        state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-issue".into(),
+            is_linked_worktree: true,
+        });
+
+        handle_confirm_close_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.request_remove_linked_worktree, None);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "main");
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn context_menu_close_group_opens_group_close_confirmation() {
+        let mut state = state_with_workspaces(&["main", "issue"]);
+        state.active = Some(0);
+        state.selected = 1;
+        state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+        state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-issue".into(),
+            is_linked_worktree: true,
+        });
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::GitWorkspace {
+                ws_idx: 0,
+                is_linked_worktree: false,
+                has_worktree_children: true,
+                collapsed: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 1);
+
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.mode, Mode::ConfirmClose);
+
+        confirm_close_accept(&mut state);
+
+        assert!(state.workspaces.is_empty());
+        assert_eq!(state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn context_menu_close_pane_last_parent_group_pane_keeps_confirmation_mode() {
+        let mut state = state_with_workspaces(&["main", "issue"]);
+        state.active = Some(0);
+        state.selected = 1;
+        state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+        state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-issue".into(),
+            is_linked_worktree: true,
+        });
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Pane {
+                pane_id,
+                has_manual_label: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(4),
+        };
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 4);
+
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.mode, Mode::ConfirmClose);
+        assert_eq!(state.workspaces.len(), 2);
     }
 }

@@ -28,14 +28,18 @@ impl App {
             let snap = crate::persist::capture(
                 &self.state.workspaces,
                 &self.state.terminals,
-                &self.state.terminal_runtimes,
+                &self.terminal_runtimes,
                 self.state.active,
                 self.state.selected,
                 self.state.agent_panel_scope,
                 self.state.sidebar_width,
                 self.state.sidebar_section_split,
+                self.state.collapsed_space_keys.clone(),
             );
-            crate::persist::save(&snap);
+            let history = self.persist_pane_history.then(|| {
+                crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
+            });
+            crate::persist::save(&snap, history.as_ref());
         }
 
         self.session_save_deadline = None;

@@ -5,7 +5,7 @@ use ratatui::{
 };
 
 use crate::app::{
-    state::{AppState, DragState, DragTarget, Mode},
+    state::{AppState, DragState, DragTarget, Mode, NavigatorTarget},
     App,
 };
 
@@ -13,6 +13,10 @@ use super::{
     modal::{leave_modal, modal_action_from_buttons, ModalAction},
     ScrollbarClickTarget,
 };
+
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
 
 impl App {
     pub(super) fn handle_overlay_mouse(&mut self, mouse: MouseEvent) -> bool {
@@ -119,6 +123,60 @@ impl App {
             return true;
         }
 
+        if self.state.mode == Mode::Navigator {
+            match mouse.kind {
+                MouseEventKind::Moved => {
+                    if let Some(idx) = self.state.navigator_row_index_at(mouse.column, mouse.row) {
+                        self.state.navigator.selected = idx;
+                        self.state.ensure_navigator_selection_visible();
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if self
+                        .state
+                        .navigator_search_contains(mouse.column, mouse.row)
+                    {
+                        self.state.navigator.search_focused = true;
+                    } else if let Some(idx) =
+                        self.state.navigator_row_index_at(mouse.column, mouse.row)
+                    {
+                        self.state.navigator.selected = idx;
+                        let target = self
+                            .state
+                            .navigator_rows()
+                            .get(idx)
+                            .map(|row| (row.target.clone(), row.is_workspace));
+                        if let Some((NavigatorTarget::Workspace { .. }, true)) = target {
+                            if self.state.navigator_row_caret_at(mouse.column) {
+                                self.state.toggle_selected_navigator_workspace();
+                            } else {
+                                self.state.accept_navigator_selection();
+                            }
+                        } else {
+                            self.state.accept_navigator_selection();
+                        }
+                    } else if !self.state.navigator_popup_contains(mouse.column, mouse.row) {
+                        leave_modal(&mut self.state);
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    self.state.navigator.scroll = self.state.navigator.scroll.saturating_sub(3);
+                    self.state.navigator.selected = self.state.navigator.scroll;
+                    self.state.clamp_navigator_selection();
+                }
+                MouseEventKind::ScrollDown => {
+                    let viewport = self.state.navigator_body_rect().height as usize;
+                    let max = self.state.navigator_max_scroll(viewport);
+                    self.state.navigator.scroll =
+                        self.state.navigator.scroll.saturating_add(3).min(max);
+                    self.state.navigator.selected = self.state.navigator.scroll;
+                    self.state.clamp_navigator_selection();
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         if self.state.mode == Mode::KeybindHelp {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left)
@@ -188,6 +246,89 @@ impl AppState {
         self.view.sidebar_rect.union(self.view.terminal_area)
     }
 
+    pub(crate) fn navigator_popup_rect(&self) -> Rect {
+        let area = self.onboarding_full_area();
+        let margin_x = (area.width / 16).max(2);
+        let margin_y = (area.height / 10).max(1);
+        let width = area.width.saturating_sub(margin_x.saturating_mul(2));
+        let height = area.height.saturating_sub(margin_y.saturating_mul(2));
+        Rect::new(
+            area.x + margin_x,
+            area.y + margin_y,
+            width.max(4),
+            height.max(4),
+        )
+    }
+
+    pub(crate) fn navigator_inner_rect(&self) -> Rect {
+        Block::default()
+            .borders(Borders::ALL)
+            .inner(self.navigator_popup_rect())
+    }
+
+    pub(crate) fn navigator_search_rect(&self) -> Rect {
+        let inner = self.navigator_inner_rect();
+        Rect::new(inner.x, inner.y, inner.width, inner.height.min(1))
+    }
+
+    pub(crate) fn navigator_body_rect(&self) -> Rect {
+        let inner = self.navigator_inner_rect();
+        if inner.height <= 4 {
+            return Rect::default();
+        }
+        Rect::new(
+            inner.x,
+            inner.y + 2,
+            inner.width,
+            inner.height.saturating_sub(4),
+        )
+    }
+
+    pub(crate) fn navigator_detail_rect(&self) -> Rect {
+        let inner = self.navigator_inner_rect();
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(2),
+            inner.width,
+            inner.height.min(1),
+        )
+    }
+
+    pub(crate) fn navigator_footer_rect(&self) -> Rect {
+        let inner = self.navigator_inner_rect();
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            inner.height.min(1),
+        )
+    }
+
+    pub(crate) fn navigator_popup_contains(&self, col: u16, row: u16) -> bool {
+        rect_contains(self.navigator_popup_rect(), col, row)
+    }
+
+    pub(crate) fn navigator_search_contains(&self, col: u16, row: u16) -> bool {
+        rect_contains(self.navigator_search_rect(), col, row)
+    }
+
+    pub(crate) fn navigator_row_index_at(&self, col: u16, row: u16) -> Option<usize> {
+        let body = self.navigator_body_rect();
+        if !rect_contains(body, col, row) {
+            return None;
+        }
+        let idx = self
+            .navigator
+            .scroll
+            .saturating_add(row.saturating_sub(body.y) as usize);
+        (idx < self.navigator_rows().len()).then_some(idx)
+    }
+
+    pub(crate) fn navigator_row_caret_at(&self, col: u16) -> bool {
+        let body = self.navigator_body_rect();
+        col <= body.x.saturating_add(3)
+    }
+
     pub(super) fn onboarding_modal_inner(&self, popup_w: u16, popup_h: u16) -> Option<Rect> {
         let area = self.onboarding_full_area();
         let popup_w = popup_w.min(area.width.saturating_sub(4));
@@ -244,7 +385,15 @@ impl AppState {
             .release_notes
             .as_ref()
             .is_some_and(|notes| notes.preview);
-        Some(crate::ui::release_notes_sections(body, preview).notes_body)
+        Some(
+            crate::ui::release_notes_sections(
+                body,
+                preview,
+                &self.update_install_command,
+                &self.palette,
+            )
+            .notes_body,
+        )
     }
 
     fn release_notes_scroll_metrics(&self) -> Option<crate::pane::ScrollMetrics> {
@@ -253,17 +402,14 @@ impl AppState {
         let viewport_rows = body.height.max(1) as usize;
         let lines = crate::ui::release_notes_display_lines(notes, &self.palette);
 
-        let rows_for_width = |wrap_width: usize| {
-            lines
-                .iter()
-                .map(|(width, _)| width.max(&1).div_ceil(wrap_width.max(1)))
-                .sum::<usize>()
+        let rows_for_width = |wrap_width: u16| {
+            crate::ui::release_notes_wrapped_line_count(&lines, wrap_width.max(1))
         };
 
-        let full_width = body.width.max(1) as usize;
+        let full_width = body.width.max(1);
         let mut total_rows = rows_for_width(full_width);
         let wrap_width = if total_rows > viewport_rows && full_width > 1 {
-            body.width.saturating_sub(1).max(1) as usize
+            body.width.saturating_sub(1).max(1)
         } else {
             full_width
         };
@@ -355,17 +501,14 @@ impl AppState {
         let viewport_rows = body.height.max(1) as usize;
         let lines = crate::ui::product_announcement_display_lines(announcement, &self.palette);
 
-        let rows_for_width = |wrap_width: usize| {
-            lines
-                .iter()
-                .map(|(width, _)| width.max(&1).div_ceil(wrap_width.max(1)))
-                .sum::<usize>()
+        let rows_for_width = |wrap_width: u16| {
+            crate::ui::release_notes_wrapped_line_count(&lines, wrap_width.max(1))
         };
 
-        let full_width = body.width.max(1) as usize;
+        let full_width = body.width.max(1);
         let mut total_rows = rows_for_width(full_width);
         let wrap_width = if total_rows > viewport_rows && full_width > 1 {
-            body.width.saturating_sub(1).max(1) as usize
+            body.width.saturating_sub(1).max(1)
         } else {
             full_width
         };

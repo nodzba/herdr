@@ -24,6 +24,31 @@ fn unique_test_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/hcli-{}-{nanos}", std::process::id()))
 }
 
+fn run_git(repo: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "git command failed: git -C {} {}",
+        repo.display(),
+        args.join(" ")
+    );
+}
+
+fn create_committed_repo(path: &Path) {
+    fs::create_dir_all(path).unwrap();
+    run_git(path, &["init", "--quiet"]);
+    run_git(path, &["config", "user.email", "herdr@example.invalid"]);
+    run_git(path, &["config", "user.name", "Herdr Test"]);
+    fs::write(path.join("README.md"), "test\n").unwrap();
+    run_git(path, &["add", "README.md"]);
+    run_git(path, &["commit", "--quiet", "-m", "initial"]);
+}
+
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -81,7 +106,27 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
 }
 
 fn spawn_herdr(config_home: &Path, runtime_dir: &Path, socket_path: &Path) -> SpawnedHerdr {
-    spawn_herdr_with_path(config_home, runtime_dir, socket_path, None)
+    spawn_herdr_with_config(
+        config_home,
+        runtime_dir,
+        socket_path,
+        None,
+        "onboarding = false\n",
+    )
+}
+
+fn spawn_herdr_with_pane_history(
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_path: &Path,
+) -> SpawnedHerdr {
+    spawn_herdr_with_config(
+        config_home,
+        runtime_dir,
+        socket_path,
+        None,
+        "onboarding = false\n[experimental]\npane_history = true\n",
+    )
 }
 
 fn app_dir_name() -> &'static str {
@@ -175,12 +220,28 @@ fn spawn_herdr_with_path(
     socket_path: &Path,
     path_override: Option<&Path>,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    spawn_herdr_with_config(
+        config_home,
+        runtime_dir,
+        socket_path,
+        path_override,
+        "onboarding = false\n",
+    )
+}
+
+fn spawn_herdr_with_config(
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_path: &Path,
+    path_override: Option<&Path>,
+    config_toml: &str,
+) -> SpawnedHerdr {
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
-        "onboarding = false\n",
+        config_home.join(app_dir_name()).join("config.toml"),
+        config_toml,
     )
     .unwrap();
 
@@ -220,8 +281,25 @@ fn run_cli(socket_path: &Path, args: &[&str]) -> std::process::Output {
     command.output().unwrap()
 }
 
+fn run_cli_in_dir(socket_path: &Path, args: &[&str], current_dir: &Path) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    command.args(args);
+    command.current_dir(current_dir);
+    command.env("HERDR_SOCKET_PATH", socket_path);
+    command.output().unwrap()
+}
+
 fn run_cli_json(socket_path: &Path, args: &[&str]) -> serde_json::Value {
     let output = run_cli(socket_path, args);
+    parse_cli_json_output(args, output)
+}
+
+fn run_cli_json_in_dir(socket_path: &Path, args: &[&str], current_dir: &Path) -> serde_json::Value {
+    let output = run_cli_in_dir(socket_path, args, current_dir);
+    parse_cli_json_output(args, output)
+}
+
+fn parse_cli_json_output(args: &[&str], output: std::process::Output) -> serde_json::Value {
     assert!(
         output.status.success(),
         "command failed: herdr {}\nstatus: {:?}\nstderr: {}\nstdout: {}",
@@ -240,6 +318,28 @@ fn run_cli_json(socket_path: &Path, args: &[&str]) -> serde_json::Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+fn wait_until(timeout: Duration, interval: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        thread::sleep(interval);
+    }
+    false
+}
+
+fn pane_read_recent_contains(socket_path: &Path, pane_id: &str, expected: &str) -> bool {
+    let output = run_cli(
+        socket_path,
+        &["pane", "read", pane_id, "--source", "recent"],
+    );
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout).contains(expected)
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -385,6 +485,22 @@ fn send_request(socket_path: &Path, json: &str) -> serde_json::Value {
 }
 
 fn run_claude_hook(action: &str, hook_input: &str) -> Option<serde_json::Value> {
+    run_shell_hook(
+        "src/integration/assets/claude/herdr-agent-state.sh",
+        &[action],
+        hook_input,
+    )
+}
+
+fn run_codex_hook(action: &str, hook_input: &str) -> Option<serde_json::Value> {
+    run_shell_hook(
+        "src/integration/assets/codex/herdr-agent-state.sh",
+        &[action],
+        hook_input,
+    )
+}
+
+fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<serde_json::Value> {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let socket_path = base.join("herdr.sock");
@@ -413,11 +529,10 @@ fn run_claude_hook(action: &str, hook_input: &str) -> Option<serde_json::Value> 
         None
     });
 
-    let hook_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/integration/assets/claude/herdr-agent-state.sh");
+    let hook_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(asset_path);
     let mut child = Command::new("bash")
         .arg(hook_path)
-        .arg(action)
+        .args(args)
         .env("HERDR_ENV", "1")
         .env("HERDR_SOCKET_PATH", &socket_path)
         .env("HERDR_PANE_ID", "p_test")
@@ -461,19 +576,13 @@ fn claude_hook_reports_subagent_working_and_blocked() {
 }
 
 #[test]
-fn claude_hook_converts_subagent_idle_and_release_to_working() {
+fn claude_hook_ignores_subagent_completion_reports() {
     let subagent_input =
         r#"{"hook_event_name":"SubagentStop","agent_id":"agent-abc123","agent_type":"Explore"}"#;
 
-    let idle = run_claude_hook("idle", subagent_input)
-        .expect("subagent idle should keep parent pane working");
-    assert_eq!(idle["method"], "pane.report_agent");
-    assert_eq!(idle["params"]["state"], "working");
-
-    let release = run_claude_hook("release", subagent_input)
-        .expect("subagent release should keep parent pane working");
-    assert_eq!(release["method"], "pane.report_agent");
-    assert_eq!(release["params"]["state"], "working");
+    assert!(run_claude_hook("working", subagent_input).is_none());
+    assert!(run_claude_hook("idle", subagent_input).is_none());
+    assert!(run_claude_hook("release", subagent_input).is_none());
 }
 
 #[test]
@@ -486,6 +595,31 @@ fn claude_hook_keeps_parent_agent_type_only_blocked() {
 
     assert_eq!(request["method"], "pane.report_agent");
     assert_eq!(request["params"]["state"], "blocked");
+}
+
+#[test]
+fn claude_hook_reports_session_id_from_stdin() {
+    let request = run_claude_hook(
+        "idle",
+        r#"{"hook_event_name":"SessionStart","session_id":"claude-session"}"#,
+    )
+    .expect("session start should report idle");
+
+    assert_eq!(request["method"], "pane.report_agent");
+    assert_eq!(request["params"]["agent_session_id"], "claude-session");
+}
+
+#[test]
+fn codex_hook_reports_session_id_from_stdin() {
+    let request = run_codex_hook(
+        "working",
+        r#"{"hook_event_name":"SessionStart","session_id":"codex-session"}"#,
+    )
+    .expect("codex hook should report working");
+
+    assert_eq!(request["method"], "pane.report_agent");
+    assert_eq!(request["params"]["state"], "working");
+    assert_eq!(request["params"]["agent_session_id"], "codex-session");
 }
 
 #[test]
@@ -559,6 +693,135 @@ fn pane_run_sends_one_send_input_request_with_enter_key() {
 }
 
 #[test]
+fn pane_report_metadata_sends_presentation_request() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        reader.read_line(&mut line).unwrap();
+        stream
+            .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
+            .unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+        line
+    });
+
+    let run = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-metadata",
+            "1-1",
+            "--source",
+            "user:claude-title",
+            "--agent",
+            "claude",
+            "--applies-to-source",
+            "herdr:claude",
+            "--title",
+            "Refactor auth",
+            "--display-agent",
+            "Claude auth",
+            "--custom-status",
+            "middleware",
+            "--state-label",
+            "working=deep in the mines",
+            "--ttl-ms",
+            "3600000",
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let line = server.join().unwrap();
+    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(request["method"], "pane.report_metadata");
+    assert_eq!(request["params"]["pane_id"], "1-1");
+    assert_eq!(request["params"]["source"], "user:claude-title");
+    assert_eq!(request["params"]["agent"], "claude");
+    assert_eq!(request["params"]["applies_to_source"], "herdr:claude");
+    assert_eq!(request["params"]["title"], "Refactor auth");
+    assert_eq!(request["params"]["display_agent"], "Claude auth");
+    assert_eq!(request["params"]["custom_status"], "middleware");
+    assert_eq!(
+        request["params"]["state_labels"]["working"],
+        "deep in the mines"
+    );
+    assert_eq!(request["params"]["ttl_ms"], 3_600_000);
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn pane_report_metadata_rejects_blank_source_before_socket_request() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("missing.sock");
+
+    let run = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-metadata",
+            "1-1",
+            "--source",
+            "   ",
+            "--custom-status",
+            "middleware",
+        ],
+    );
+
+    assert_eq!(run.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("missing required --source"),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn pane_report_metadata_rejects_blank_applies_to_source_before_socket_request() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("missing.sock");
+
+    let run = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-metadata",
+            "1-1",
+            "--source",
+            "user:claude-title",
+            "--applies-to-source",
+            "   ",
+            "--custom-status",
+            "middleware",
+        ],
+    );
+
+    assert_eq!(run.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("missing value for --applies-to-source"),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn help_commands_exit_successfully() {
     let help_cases: &[&[&str]] = &[
         &["-h"],
@@ -566,6 +829,7 @@ fn help_commands_exit_successfully() {
         &["status", "-h"],
         &["server", "-h"],
         &["workspace", "-h"],
+        &["worktree", "-h"],
         &["tab", "-h"],
         &["pane", "-h"],
         &["wait", "-h"],
@@ -974,7 +1238,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {full_stdout}"
     );
     assert!(
-        full_stdout.contains("  protocol: 8"),
+        full_stdout.contains("  protocol: 12"),
         "stdout: {full_stdout}"
     );
     assert!(full_stdout.contains("server:\n"), "stdout: {full_stdout}");
@@ -1007,7 +1271,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {server_stdout}"
     );
     assert!(
-        server_stdout.contains("protocol: 8"),
+        server_stdout.contains("protocol: 12"),
         "stdout: {server_stdout}"
     );
 
@@ -1019,13 +1283,39 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {client_stdout}"
     );
     assert!(
-        client_stdout.contains("protocol: 8"),
+        client_stdout.contains("protocol: 12"),
         "stdout: {client_stdout}"
     );
     assert!(
         client_stdout.contains("binary: "),
         "stdout: {client_stdout}"
     );
+
+    let full_json = run_cli_json(&socket_path, &["status", "--json"]);
+    assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(full_json["client"]["protocol"], 12);
+    assert_eq!(full_json["server"]["status"], "running");
+    assert_eq!(full_json["server"]["running"], true);
+    assert_eq!(full_json["server"]["compatible"], true);
+    assert_eq!(
+        full_json["server"]["socket"],
+        socket_path.display().to_string()
+    );
+    assert_eq!(full_json["server"]["restart_needed"], false);
+    assert_eq!(full_json["update"]["restart_needed"], false);
+
+    let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
+    assert_eq!(server_json["status"], "running");
+    assert_eq!(server_json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(server_json["protocol"], 12);
+    assert_eq!(server_json["compatible"], true);
+
+    let client_json = run_cli_json(&socket_path, &["status", "client", "--json"]);
+    assert_eq!(client_json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(client_json["protocol"], 12);
+    assert!(client_json["binary"]
+        .as_str()
+        .is_some_and(|path| !path.is_empty()));
 
     cleanup_spawned_herdr(herdr, base);
 }
@@ -1047,6 +1337,16 @@ fn status_reports_not_running_when_server_socket_is_missing() {
         stdout.contains(&socket_path.display().to_string()),
         "stdout: {stdout}"
     );
+
+    let status_json = run_cli_json(&socket_path, &["status", "--json"]);
+    assert_eq!(status_json["server"]["status"], "not_running");
+    assert_eq!(status_json["server"]["running"], false);
+    assert_eq!(
+        status_json["server"]["socket"],
+        socket_path.display().to_string()
+    );
+    assert_eq!(status_json["server"]["restart_needed"], false);
+    assert_eq!(status_json["update"]["restart_needed"], false);
 
     cleanup_test_base(&base);
 }
@@ -1095,6 +1395,98 @@ fn server_stop_command_shuts_down_running_server() {
     );
 
     cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn server_stop_then_restart_restores_pane_history() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let marker = "PERSISTED_HISTORY_AFTER_STOP";
+
+    let mut herdr = spawn_herdr_with_pane_history(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            base.to_str().expect("test path should be utf-8"),
+            "--label",
+            "history-restart",
+        ],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("workspace create should return root pane id")
+        .to_string();
+    let sent = run_cli(
+        &socket_path,
+        &["pane", "send-text", &pane_id, &format!("echo {marker}\n")],
+    );
+    assert!(
+        sent.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
+            pane_read_recent_contains(&socket_path, &pane_id, marker)
+        }),
+        "pane should contain marker before server stop"
+    );
+
+    let stopped = run_cli(&socket_path, &["server", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+
+    let pid = herdr.child.process_id();
+    let exit_status = herdr.child.wait().unwrap();
+    unregister_spawned_herdr_pid(pid);
+    assert!(exit_status.success(), "server stop should exit cleanly");
+    drop(herdr);
+
+    let restarted = spawn_herdr_with_pane_history(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+
+    let workspaces = run_cli_json(&socket_path, &["workspace", "list"]);
+    let workspace_id = workspaces["result"]["workspaces"]
+        .as_array()
+        .expect("workspace.list should return workspaces")
+        .iter()
+        .find(|workspace| workspace["label"] == "history-restart")
+        .and_then(|workspace| workspace["workspace_id"].as_str())
+        .expect("restored workspace should exist")
+        .to_string();
+    let panes = run_cli_json(
+        &socket_path,
+        &["pane", "list", "--workspace", &workspace_id],
+    );
+    let restored_pane_id = panes["result"]["panes"]
+        .as_array()
+        .expect("pane.list should return panes")
+        .first()
+        .and_then(|pane| pane["pane_id"].as_str())
+        .expect("restored pane should exist")
+        .to_string();
+
+    assert!(
+        wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
+            pane_read_recent_contains(&socket_path, &restored_pane_id, marker)
+        }),
+        "restarted server should restore saved pane history"
+    );
+
+    cleanup_spawned_herdr(restarted, base);
 }
 
 #[test]
@@ -1185,6 +1577,294 @@ fn workspace_and_pane_management_commands_work() {
     assert_eq!(closed_workspace_json["result"]["type"], "ok");
 
     cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn worktree_management_commands_work() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let repo = base.join("repo");
+    let checkout = base.join("checkout");
+    create_committed_repo(&repo);
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let branch = "worktree/cli-wrapper";
+    let created = run_cli_json(
+        &socket_path,
+        &[
+            "worktree",
+            "create",
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--branch",
+            branch,
+            "--path",
+            checkout.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(created["result"]["type"], "worktree_created");
+    assert_eq!(created["result"]["worktree"]["branch"], branch);
+    let child_workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(checkout.join("README.md").exists());
+
+    let workspaces = run_cli_json(&socket_path, &["workspace", "list"]);
+    let workspace_list = workspaces["result"]["workspaces"].as_array().unwrap();
+    let parent_workspace_id = workspace_list
+        .iter()
+        .find(|workspace| workspace["worktree"]["is_linked_worktree"].as_bool() == Some(false))
+        .and_then(|workspace| workspace["workspace_id"].as_str())
+        .unwrap()
+        .to_string();
+    assert!(workspace_list.iter().any(|workspace| {
+        workspace["workspace_id"].as_str() == Some(child_workspace_id.as_str())
+            && workspace["worktree"]["is_linked_worktree"].as_bool() == Some(true)
+    }));
+
+    let listed = run_cli_json(
+        &socket_path,
+        &[
+            "worktree",
+            "list",
+            "--workspace",
+            &parent_workspace_id,
+            "--json",
+        ],
+    );
+    let listed_entry = listed["result"]["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["branch"].as_str() == Some(branch))
+        .unwrap();
+    assert_eq!(
+        listed_entry["open_workspace_id"].as_str(),
+        Some(child_workspace_id.as_str())
+    );
+
+    let opened = run_cli_json(
+        &socket_path,
+        &[
+            "worktree",
+            "open",
+            "--workspace",
+            &parent_workspace_id,
+            "--branch",
+            branch,
+            "--json",
+        ],
+    );
+    assert_eq!(opened["result"]["type"], "worktree_opened");
+    assert_eq!(opened["result"]["already_open"], true);
+    assert_eq!(
+        opened["result"]["workspace"]["workspace_id"].as_str(),
+        Some(child_workspace_id.as_str())
+    );
+
+    fs::write(checkout.join("README.md"), "dirty\n").unwrap();
+    let safe_remove = run_cli(
+        &socket_path,
+        &[
+            "worktree",
+            "remove",
+            "--workspace",
+            &child_workspace_id,
+            "--json",
+        ],
+    );
+    assert_eq!(safe_remove.status.code(), Some(1));
+    let safe_remove_json: serde_json::Value = serde_json::from_slice(&safe_remove.stderr).unwrap();
+    assert_eq!(
+        safe_remove_json["error"]["code"],
+        "dirty_worktree_requires_force"
+    );
+    assert!(checkout.exists());
+
+    let force_removed = run_cli_json(
+        &socket_path,
+        &[
+            "worktree",
+            "remove",
+            "--workspace",
+            &child_workspace_id,
+            "--force",
+            "--json",
+        ],
+    );
+    assert_eq!(force_removed["result"]["type"], "worktree_removed");
+    assert_eq!(force_removed["result"]["forced"], true);
+    assert!(!checkout.exists());
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn worktree_open_existing_checkout_by_path_and_branch() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let repo = base.join("repo");
+    let checkout = base.join("external-checkout");
+    create_committed_repo(&repo);
+    let branch = "worktree/cli-open-existing";
+    run_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            branch,
+            checkout.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let opened = run_cli_json_in_dir(
+        &socket_path,
+        &[
+            "worktree",
+            "open",
+            "--cwd",
+            "repo",
+            "--path",
+            "external-checkout",
+            "--json",
+        ],
+        &base,
+    );
+    assert_eq!(opened["result"]["type"], "worktree_opened");
+    assert_eq!(opened["result"]["already_open"], false);
+    assert_eq!(opened["result"]["worktree"]["branch"], branch);
+    assert_eq!(
+        opened["result"]["workspace"]["worktree"]["is_linked_worktree"],
+        true
+    );
+    let child_workspace_id = opened["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let workspaces = run_cli_json(&socket_path, &["workspace", "list"]);
+    let workspace_list = workspaces["result"]["workspaces"].as_array().unwrap();
+    let parent_workspace_id = workspace_list
+        .iter()
+        .find(|workspace| workspace["worktree"]["is_linked_worktree"].as_bool() == Some(false))
+        .and_then(|workspace| workspace["workspace_id"].as_str())
+        .unwrap()
+        .to_string();
+
+    let listed = run_cli_json(
+        &socket_path,
+        &[
+            "worktree",
+            "list",
+            "--workspace",
+            &parent_workspace_id,
+            "--json",
+        ],
+    );
+    let listed_entry = listed["result"]["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["branch"].as_str() == Some(branch))
+        .unwrap();
+    assert_eq!(
+        listed_entry["open_workspace_id"].as_str(),
+        Some(child_workspace_id.as_str())
+    );
+
+    let reopened = run_cli_json(
+        &socket_path,
+        &[
+            "worktree",
+            "open",
+            "--workspace",
+            &parent_workspace_id,
+            "--branch",
+            branch,
+            "--json",
+        ],
+    );
+    assert_eq!(reopened["result"]["type"], "worktree_opened");
+    assert_eq!(reopened["result"]["already_open"], true);
+    assert_eq!(
+        reopened["result"]["workspace"]["workspace_id"].as_str(),
+        Some(child_workspace_id.as_str())
+    );
+
+    let removed = run_cli_json(
+        &socket_path,
+        &[
+            "worktree",
+            "remove",
+            "--workspace",
+            &child_workspace_id,
+            "--force",
+            "--json",
+        ],
+    );
+    assert_eq!(removed["result"]["type"], "worktree_removed");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn worktree_cli_rejects_local_argument_errors_before_socket_use() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("missing.sock");
+    let cases: &[&[&str]] = &[
+        &["worktree", "list", "--workspace", "1", "--cwd", "/tmp"],
+        &["worktree", "create", "--workspace", "1", "--cwd", "/tmp"],
+        &["worktree", "open", "--workspace", "1"],
+        &[
+            "worktree",
+            "open",
+            "--workspace",
+            "1",
+            "--path",
+            "a",
+            "--branch",
+            "b",
+        ],
+        &[
+            "worktree",
+            "open",
+            "--workspace",
+            "1",
+            "--cwd",
+            "/tmp",
+            "--branch",
+            "b",
+        ],
+    ];
+
+    for args in cases {
+        let output = run_cli(&socket_path, args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "herdr {} should fail as local parse error; stdout={} stderr={}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    cleanup_test_base(&base);
 }
 
 #[test]
@@ -1510,6 +2190,7 @@ fn pane_run_read_and_wait_commands_work() {
     );
     assert!(create.status.success());
 
+    let started = Instant::now();
     let waited = run_cli(
         &socket_path,
         &[
@@ -1526,10 +2207,15 @@ fn pane_run_read_and_wait_commands_work() {
             "5000",
         ],
     );
+    let elapsed = started.elapsed();
     assert!(
         waited.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&waited.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "already-matching wait took {elapsed:?}"
     );
     let waited_json: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
     assert_eq!(waited_json["result"]["type"], "output_matched");
@@ -1973,6 +2659,63 @@ fn wait_agent_status_exits_when_idle_status_matches() {
             "idle",
             "--timeout",
             "5000",
+        ],
+    );
+    assert!(
+        waited.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let waited_json: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
+    assert_eq!(waited_json["event"], "pane.agent_status_changed");
+    assert_eq!(waited_json["data"]["agent_status"], "idle");
+    assert_eq!(waited_json["data"]["agent"], "pi");
+
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
+fn wait_agent_status_exits_immediately_when_status_already_matches() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_cli_immediate_1","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pane_id = format!("{workspace_id}-1");
+
+    let reported = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_cli_immediate_2","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"idle"}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(reported["result"]["type"], "ok");
+
+    let waited = run_cli(
+        &socket_path,
+        &[
+            "wait",
+            "agent-status",
+            "1-1",
+            "--status",
+            "idle",
+            "--timeout",
+            "1000",
         ],
     );
     assert!(

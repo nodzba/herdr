@@ -1,30 +1,78 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use super::{
-    api_helpers::{
-        detect_state_from_api, encode_api_keys, encode_api_text, normalize_custom_status,
-        normalize_reported_agent_label, pane_agent_status,
-    },
-    App, Mode, OverlayPaneState, ToastKind,
-};
+mod agents;
+mod integrations;
+mod panes;
+mod responses;
+mod tabs;
+mod workspaces;
+mod worktrees;
+
+use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};
 use crate::events::AppEvent;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeExitAction {
+    RespawnShell,
+    ClosePane,
+}
 
 impl App {
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
         if let AppEvent::ClipboardWrite { content } = ev {
+            #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);
+            #[cfg(test)]
+            let _ = content;
+            self.show_clipboard_feedback();
             return;
         }
 
-        if let AppEvent::GitStatusRefreshed { results } = ev {
+        if let AppEvent::GitStatusRefreshed {
+            results,
+            cache_updates,
+        } = ev
+        {
             self.git_refresh_in_flight = false;
-            self.last_git_remote_status_refresh = Instant::now();
-            if self.state.apply_workspace_git_statuses(results) {
+            for (key, entry) in cache_updates {
+                self.git_status_cache.insert(key, entry);
+            }
+            if self.git_refresh_due_after_in_flight {
+                self.mark_git_status_refresh_due(Instant::now());
+                self.git_refresh_due_after_in_flight = false;
+            } else {
+                self.last_git_remote_status_refresh = Instant::now();
+            }
+            if self
+                .state
+                .apply_workspace_git_statuses(&self.terminal_runtimes, results)
+            {
                 self.render_dirty.store(true, Ordering::Release);
                 self.render_notify.notify_one();
             }
             return;
+        }
+
+        if let AppEvent::WorktreeAddFinished(result) = ev {
+            self.handle_worktree_add_finished(result);
+            return;
+        }
+
+        if let AppEvent::WorktreeRemoveFinished(result) = ev {
+            self.handle_worktree_remove_finished(result);
+            return;
+        }
+
+        if let AppEvent::PaneDied { pane_id } = &ev {
+            if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
+                && self.respawn_shell_for_launch_pane(*pane_id)
+            {
+                self.overlay_panes.remove(pane_id);
+                self.render_dirty.store(true, Ordering::Release);
+                self.render_notify.notify_one();
+                return;
+            }
         }
 
         let overlay_state = if let AppEvent::PaneDied { pane_id } = &ev {
@@ -70,13 +118,18 @@ impl App {
         let previous_toast = self.state.toast.clone();
         let pane_updates = self.state.handle_app_event(ev);
         for update in &pane_updates {
+            self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
             self.emit_pane_state_update(update);
         }
+        self.sync_agent_metadata_deadline();
         if let Some((pane_id, agent)) = released_agent {
             if pane_updates.iter().any(|update| update.pane_id == pane_id) {
                 if let Some((ws_idx, _)) = self.find_pane(pane_id) {
-                    if let Some(runtime) = self.state.runtime_for_pane_in_workspace(ws_idx, pane_id)
-                    {
+                    if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                        &self.terminal_runtimes,
+                        ws_idx,
+                        pane_id,
+                    ) {
                         runtime.begin_graceful_release(agent);
                     }
                 }
@@ -99,10 +152,8 @@ impl App {
             };
 
             if let Some((version, install_command)) = update_ready {
-                let _ = notify(
-                    &format!("v{version} available"),
-                    Some(&format!("detach, then run `{install_command}`")),
-                );
+                let instruction = crate::update::update_install_instruction(&install_command);
+                let _ = notify(&format!("v{version} available"), Some(&instruction));
             } else {
                 for update in &pane_updates {
                     let is_active_tab = self
@@ -143,10 +194,13 @@ impl App {
                         ToastKind::Finished => "finished",
                         ToastKind::UpdateInstalled => "updated",
                     };
+                    let workspace_label =
+                        ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
                     let _ = notify(
                         &format!("{} {}", agent_label, event_text),
                         Some(&crate::app::actions::notification_context(
                             ws,
+                            &workspace_label,
                             update.ws_idx,
                             update.pane_id,
                         )),
@@ -156,6 +210,57 @@ impl App {
         }
 
         self.sync_toast_deadline(previous_toast);
+        self.shutdown_detached_terminal_runtimes();
+    }
+
+    pub(crate) fn refresh_new_herdr_toast_context_for_update(
+        &mut self,
+        update: &crate::app::actions::PaneStateUpdate,
+        previous_toast: &Option<crate::app::state::ToastNotification>,
+    ) {
+        if !matches!(
+            self.state.toast_config.delivery,
+            crate::config::ToastDelivery::Herdr
+        ) || self.state.toast == *previous_toast
+        {
+            return;
+        }
+
+        let Some(target) = self
+            .state
+            .toast
+            .as_ref()
+            .and_then(|toast| toast.target.as_ref())
+        else {
+            return;
+        };
+        if target.pane_id != update.pane_id {
+            return;
+        }
+        let Some(ws) = self.state.workspaces.get(update.ws_idx) else {
+            return;
+        };
+        if ws.id != target.workspace_id {
+            return;
+        }
+
+        let workspace_label = ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
+        let context = crate::app::actions::notification_context(
+            ws,
+            &workspace_label,
+            update.ws_idx,
+            update.pane_id,
+        );
+        if let Some(toast) = self.state.toast.as_mut() {
+            toast.context = context;
+        }
+    }
+
+    pub(crate) fn show_clipboard_feedback(&mut self) {
+        self.state.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: "copied to clipboard".to_string(),
+        });
+        self.copy_feedback_deadline = Some(Instant::now() + super::COPY_FEEDBACK_DURATION);
     }
 
     fn restore_overlay_after_exit(&mut self, overlay: OverlayPaneState) {
@@ -182,7 +287,70 @@ impl App {
         }
     }
 
-    fn emit_pane_state_update(&self, update: &crate::app::actions::PaneStateUpdate) {
+    fn runtime_exit_action(&self, pane_id: crate::layout::PaneId) -> RuntimeExitAction {
+        let Some((_, pane_state)) = self.find_pane(pane_id) else {
+            return RuntimeExitAction::ClosePane;
+        };
+        let Some(terminal) = self.state.terminals.get(&pane_state.attached_terminal_id) else {
+            return RuntimeExitAction::ClosePane;
+        };
+
+        if terminal.respawn_shell_on_exit {
+            RuntimeExitAction::RespawnShell
+        } else {
+            RuntimeExitAction::ClosePane
+        }
+    }
+
+    fn respawn_shell_for_launch_pane(&mut self, pane_id: crate::layout::PaneId) -> bool {
+        let Some((ws_idx, pane_state)) = self.find_pane(pane_id) else {
+            return false;
+        };
+        let terminal_id = pane_state.attached_terminal_id.clone();
+        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
+            return false;
+        };
+
+        let cwd = terminal.cwd.clone();
+        let (rows, cols) = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .map(|runtime| runtime.current_size())
+            .unwrap_or_else(|| self.state.estimate_pane_size());
+        let runtime = match crate::terminal::TerminalRuntime::spawn(
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                tracing::warn!(
+                    pane = pane_id.raw(),
+                    terminal = %terminal_id,
+                    err = %err,
+                    "failed to respawn shell after launch command exited"
+                );
+                return false;
+            }
+        };
+
+        self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.clear_agent_runtime_identity_after_respawn();
+        }
+        self.state.focus_pane_in_workspace(ws_idx, pane_id);
+        self.schedule_session_save();
+        true
+    }
+
+    pub(crate) fn emit_pane_state_update(&self, update: &crate::app::actions::PaneStateUpdate) {
         let Some(pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
             return;
         };
@@ -199,22 +367,30 @@ impl App {
             });
         }
 
-        if update.previous_state != update.state {
-            let agent_status = self
-                .state
-                .workspaces
-                .get(update.ws_idx)
-                .and_then(|ws| ws.pane_state(update.pane_id))
-                .map(|pane| pane_agent_status(update.state, pane.seen))
-                .unwrap_or_else(|| pane_agent_status(update.state, true));
-            let custom_status = update.custom_status.clone();
+        let previous_agent_status = pane_agent_status(update.previous_state, update.previous_seen);
+        let agent_status = self
+            .state
+            .workspaces
+            .get(update.ws_idx)
+            .and_then(|ws| ws.pane_state(update.pane_id))
+            .map(|pane| pane_agent_status(update.state, pane.seen))
+            .unwrap_or_else(|| pane_agent_status(update.state, update.seen));
+
+        if previous_agent_status != agent_status
+            || update.previous_presentation != update.presentation
+        {
+            let presentation = update.presentation.clone();
             self.emit_event(crate::api::schema::EventEnvelope {
                 event: crate::api::schema::EventKind::PaneAgentStatusChanged,
                 data: crate::api::schema::EventData::PaneAgentStatusChanged {
                     pane_id,
                     workspace_id,
                     agent_status,
-                    custom_status,
+                    agent: update.agent_label.clone(),
+                    title: presentation.title,
+                    display_agent: presentation.display_agent,
+                    custom_status: presentation.custom_status,
+                    state_labels: presentation.state_labels,
                 },
             });
         }
@@ -293,25 +469,26 @@ impl App {
         pane_id: crate::layout::PaneId,
         event: crate::ghostty::FocusEvent,
     ) {
-        let Some(runtime) = self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|_| self.state.runtime_for_pane_in_workspace(ws_idx, pane_id))
-        else {
+        let Some(runtime) = self.state.workspaces.get(ws_idx).and_then(|_| {
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        }) else {
             return;
         };
         runtime.try_send_focus_event(event);
     }
 
     pub(crate) fn handle_api_request(&mut self, request: crate::api::schema::Request) -> String {
-        self.drain_internal_events();
-        use bytes::Bytes;
+        self.drain_all_internal_events();
+        self.handle_api_request_after_internal_events_drained(request)
+    }
 
+    pub(crate) fn handle_api_request_after_internal_events_drained(
+        &mut self,
+        request: crate::api::schema::Request,
+    ) -> String {
         use crate::api::schema::{
-            ErrorBody, ErrorResponse, IntegrationInstallResult, IntegrationUninstallResult, Method,
-            PaneListParams, PaneReadResult, ReadFormat, ReadSource, ResponseResult,
-            SuccessResponse, TabListParams,
+            ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
 
         let response = match request.method {
@@ -321,6 +498,16 @@ impl App {
                     id: request.id,
                     result: ResponseResult::Ok {},
                 }
+            }
+            Method::ServerLiveHandoff(_) => {
+                let response = ErrorResponse {
+                    id: request.id,
+                    error: ErrorBody {
+                        code: "unsupported_in_app_mode".into(),
+                        message: "live handoff is only supported by the headless server".into(),
+                    },
+                };
+                return serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
             }
             Method::ServerReloadConfig(_) => {
                 let report = self.reload_config();
@@ -332,1015 +519,57 @@ impl App {
                     },
                 }
             }
-            Method::WorkspaceList(_) => SuccessResponse {
-                id: request.id,
-                result: ResponseResult::WorkspaceList {
-                    workspaces: self
-                        .state
-                        .workspaces
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, _)| self.workspace_info(idx))
-                        .collect(),
-                },
-            },
-            Method::WorkspaceGet(target) => {
-                let Some(index) = self.parse_workspace_id(&target.workspace_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "workspace_not_found".into(),
-                            message: format!("workspace {} not found", target.workspace_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(_) = self.state.workspaces.get(index) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "workspace_not_found".into(),
-                            message: format!("workspace {} not found", target.workspace_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::WorkspaceInfo {
-                        workspace: self.workspace_info(index),
-                    },
-                }
-            }
+            Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
+            Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
-                let cwd = params
-                    .cwd
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| std::env::current_dir().ok())
-                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
-                match self.create_workspace_with_options(cwd, params.focus) {
-                    Ok(index) => {
-                        if let Some(label) = params.label {
-                            if let Some(workspace) = self.state.workspaces.get_mut(index) {
-                                workspace.set_custom_name(label);
-                                crate::logging::workspace_renamed(&workspace.id);
-                            }
-                        }
-                        let workspace = self.workspace_info(index);
-                        let tab = self
-                            .tab_info(index, 0)
-                            .expect("new workspace should have an initial tab");
-                        let root_pane = self
-                            .root_pane_info(index, 0)
-                            .expect("new workspace should have an initial root pane");
-                        self.emit_event(crate::api::schema::EventEnvelope {
-                            event: crate::api::schema::EventKind::WorkspaceCreated,
-                            data: crate::api::schema::EventData::WorkspaceCreated {
-                                workspace: workspace.clone(),
-                            },
-                        });
-                        self.emit_event(crate::api::schema::EventEnvelope {
-                            event: crate::api::schema::EventKind::TabCreated,
-                            data: crate::api::schema::EventData::TabCreated { tab: tab.clone() },
-                        });
-                        self.emit_event(crate::api::schema::EventEnvelope {
-                            event: crate::api::schema::EventKind::PaneCreated,
-                            data: crate::api::schema::EventData::PaneCreated {
-                                pane: root_pane.clone(),
-                            },
-                        });
-                        SuccessResponse {
-                            id: request.id,
-                            result: self
-                                .workspace_created_result(index)
-                                .expect("new workspace should produce a complete create response"),
-                        }
-                    }
-                    Err(err) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "workspace_create_failed".into(),
-                                message: err.to_string(),
-                            },
-                        })
-                        .unwrap();
-                    }
-                }
+                return self.handle_workspace_create(request.id, params);
             }
             Method::WorkspaceFocus(target) => {
-                let Some(index) = self.parse_workspace_id(&target.workspace_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "workspace_not_found".into(),
-                            message: format!("workspace {} not found", target.workspace_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                if self.state.workspaces.get(index).is_none() {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "workspace_not_found".into(),
-                            message: format!("workspace {} not found", target.workspace_id),
-                        },
-                    })
-                    .unwrap();
-                }
-                self.state.switch_workspace(index);
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::WorkspaceInfo {
-                        workspace: self.workspace_info(index),
-                    },
-                }
+                return self.handle_workspace_focus(request.id, target)
             }
             Method::WorkspaceRename(params) => {
-                let Some(index) = self.parse_workspace_id(&params.workspace_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "workspace_not_found".into(),
-                            message: format!("workspace {} not found", params.workspace_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(ws) = self.state.workspaces.get_mut(index) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "workspace_not_found".into(),
-                            message: format!("workspace {} not found", params.workspace_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                ws.set_custom_name(params.label.clone());
-                crate::logging::workspace_renamed(&ws.id);
-                self.schedule_session_save();
-                self.emit_event(crate::api::schema::EventEnvelope {
-                    event: crate::api::schema::EventKind::WorkspaceRenamed,
-                    data: crate::api::schema::EventData::WorkspaceRenamed {
-                        workspace_id: self.public_workspace_id(index),
-                        label: params.label,
-                    },
-                });
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::WorkspaceInfo {
-                        workspace: self.workspace_info(index),
-                    },
-                }
+                return self.handle_workspace_rename(request.id, params);
             }
             Method::WorkspaceClose(target) => {
-                let Some(index) = self.parse_workspace_id(&target.workspace_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "workspace_not_found".into(),
-                            message: format!("workspace {} not found", target.workspace_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                if self.state.workspaces.get(index).is_none() {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "workspace_not_found".into(),
-                            message: format!("workspace {} not found", target.workspace_id),
-                        },
-                    })
-                    .unwrap();
-                }
-                self.state.selected = index;
-                self.state.close_selected_workspace();
-                self.emit_event(crate::api::schema::EventEnvelope {
-                    event: crate::api::schema::EventKind::WorkspaceClosed,
-                    data: crate::api::schema::EventData::WorkspaceClosed {
-                        workspace_id: target.workspace_id,
-                    },
-                });
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::Ok {},
-                }
+                return self.handle_workspace_close(request.id, target)
             }
-            Method::TabList(TabListParams { workspace_id }) => {
-                let tabs = if let Some(workspace_id) = workspace_id {
-                    let Some(ws_idx) = self.parse_workspace_id(&workspace_id) else {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "workspace_not_found".into(),
-                                message: format!("workspace {} not found", workspace_id),
-                            },
-                        })
-                        .unwrap();
-                    };
-                    let Some(ws) = self.state.workspaces.get(ws_idx) else {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "workspace_not_found".into(),
-                                message: format!("workspace {} not found", workspace_id),
-                            },
-                        })
-                        .unwrap();
-                    };
-                    (0..ws.tabs.len())
-                        .filter_map(|tab_idx| self.tab_info(ws_idx, tab_idx))
-                        .collect()
-                } else {
-                    let mut tabs = Vec::new();
-                    for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
-                        for tab_idx in 0..ws.tabs.len() {
-                            if let Some(tab) = self.tab_info(ws_idx, tab_idx) {
-                                tabs.push(tab);
-                            }
-                        }
-                    }
-                    tabs
-                };
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::TabList { tabs },
-                }
+            Method::WorktreeList(params) => return self.handle_worktree_list(request.id, params),
+            Method::WorktreeCreate(params) => {
+                return self.handle_worktree_create(request.id, params);
             }
-            Method::TabGet(target) => {
-                let Some((ws_idx, tab_idx)) = self.parse_tab_id(&target.tab_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "tab_not_found".into(),
-                            message: format!("tab {} not found", target.tab_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(tab) = self.tab_info(ws_idx, tab_idx) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "tab_not_found".into(),
-                            message: format!("tab {} not found", target.tab_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::TabInfo { tab },
-                }
+            Method::WorktreeOpen(params) => return self.handle_worktree_open(request.id, params),
+            Method::WorktreeRemove(params) => {
+                return self.handle_worktree_remove(request.id, params);
             }
-            Method::TabCreate(params) => {
-                let crate::api::schema::TabCreateParams {
-                    workspace_id,
-                    cwd,
-                    focus,
-                    label,
-                } = params;
-                let ws_idx = if let Some(workspace_id) = workspace_id {
-                    let Some(ws_idx) = self.parse_workspace_id(&workspace_id) else {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "workspace_not_found".into(),
-                                message: format!("workspace {} not found", workspace_id),
-                            },
-                        })
-                        .unwrap();
-                    };
-                    ws_idx
-                } else if let Some(active) = self.state.active {
-                    active
-                } else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "workspace_not_found".into(),
-                            message: "no active workspace".into(),
-                        },
-                    })
-                    .unwrap();
-                };
-                let cwd = cwd
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| {
-                        self.state
-                            .focused_runtime_in_workspace(ws_idx)
-                            .and_then(|rt| rt.cwd())
-                    })
-                    .or_else(|| std::env::current_dir().ok())
-                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
-                let (rows, cols) = self.state.estimate_pane_size();
-                let default_shell = self.state.default_shell.clone();
-                let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
-                let host_terminal_theme = self.state.host_terminal_theme;
-                let result = self
-                    .state
-                    .workspaces
-                    .get_mut(ws_idx)
-                    .ok_or_else(|| std::io::Error::other("workspace disappeared"))
-                    .and_then(|ws| {
-                        ws.create_tab(
-                            rows,
-                            cols,
-                            cwd,
-                            scrollback_limit_bytes,
-                            host_terminal_theme,
-                            &default_shell,
-                        )
-                    });
-                match result {
-                    Ok((tab_idx, terminal, runtime)) => {
-                        self.state
-                            .terminal_runtimes
-                            .insert(terminal.id.clone(), runtime);
-                        self.state.terminals.insert(terminal.id.clone(), terminal);
-                        if let Some(label) = label {
-                            let workspace_id = self.state.workspaces[ws_idx].id.clone();
-                            let tab_id = self
-                                .public_tab_id(ws_idx, tab_idx)
-                                .unwrap_or_else(|| format!("{}:{}", workspace_id, tab_idx + 1));
-                            if let Some(tab) = self
-                                .state
-                                .workspaces
-                                .get_mut(ws_idx)
-                                .and_then(|ws| ws.tabs.get_mut(tab_idx))
-                            {
-                                tab.set_custom_name(label);
-                                crate::logging::tab_renamed(&workspace_id, &tab_id);
-                            }
-                        }
-                        if focus {
-                            self.state.switch_workspace(ws_idx);
-                            self.state.switch_tab(tab_idx);
-                            self.state.mode = Mode::Terminal;
-                        }
-                        self.schedule_session_save();
-                        let tab = self.tab_info(ws_idx, tab_idx).unwrap();
-                        let root_pane = self
-                            .root_pane_info(ws_idx, tab_idx)
-                            .expect("new tab should have a root pane");
-                        self.emit_event(crate::api::schema::EventEnvelope {
-                            event: crate::api::schema::EventKind::TabCreated,
-                            data: crate::api::schema::EventData::TabCreated { tab: tab.clone() },
-                        });
-                        self.emit_event(crate::api::schema::EventEnvelope {
-                            event: crate::api::schema::EventKind::PaneCreated,
-                            data: crate::api::schema::EventData::PaneCreated {
-                                pane: root_pane.clone(),
-                            },
-                        });
-                        SuccessResponse {
-                            id: request.id,
-                            result: self
-                                .tab_created_result(ws_idx, tab_idx)
-                                .expect("new tab should produce a complete create response"),
-                        }
-                    }
-                    Err(err) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "tab_create_failed".into(),
-                                message: err.to_string(),
-                            },
-                        })
-                        .unwrap();
-                    }
-                }
-            }
-            Method::TabFocus(target) => {
-                let Some((ws_idx, tab_idx)) = self.parse_tab_id(&target.tab_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "tab_not_found".into(),
-                            message: format!("tab {} not found", target.tab_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                self.state.switch_workspace(ws_idx);
-                self.state.switch_tab(tab_idx);
-                let tab = self.tab_info(ws_idx, tab_idx).unwrap();
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::TabInfo { tab },
-                }
-            }
-            Method::TabRename(params) => {
-                let Some((ws_idx, tab_idx)) = self.parse_tab_id(&params.tab_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "tab_not_found".into(),
-                            message: format!("tab {} not found", params.tab_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let workspace_id = self.state.workspaces[ws_idx].id.clone();
-                let tab_id = self
-                    .public_tab_id(ws_idx, tab_idx)
-                    .unwrap_or_else(|| format!("{}:{}", workspace_id, tab_idx + 1));
-                let Some(tab) = self
-                    .state
-                    .workspaces
-                    .get_mut(ws_idx)
-                    .and_then(|ws| ws.tabs.get_mut(tab_idx))
-                else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "tab_not_found".into(),
-                            message: format!("tab {} not found", params.tab_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                tab.set_custom_name(params.label.clone());
-                crate::logging::tab_renamed(&workspace_id, &tab_id);
-                self.schedule_session_save();
-                self.emit_event(crate::api::schema::EventEnvelope {
-                    event: crate::api::schema::EventKind::TabRenamed,
-                    data: crate::api::schema::EventData::TabRenamed {
-                        tab_id: self.public_tab_id(ws_idx, tab_idx).unwrap(),
-                        workspace_id: self.public_workspace_id(ws_idx),
-                        label: params.label,
-                    },
-                });
-                let tab = self.tab_info(ws_idx, tab_idx).unwrap();
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::TabInfo { tab },
-                }
-            }
-            Method::TabClose(target) => {
-                let Some((ws_idx, tab_idx)) = self.parse_tab_id(&target.tab_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "tab_not_found".into(),
-                            message: format!("tab {} not found", target.tab_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let terminal_ids = self.state.terminal_ids_for_tab(ws_idx, tab_idx);
-                let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "tab_not_found".into(),
-                            message: format!("tab {} not found", target.tab_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                if ws.tabs.len() <= 1 {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "tab_close_failed".into(),
-                            message: "cannot close the last tab in a workspace".into(),
-                        },
-                    })
-                    .unwrap();
-                }
-                if !ws.close_tab(tab_idx) {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "tab_close_failed".into(),
-                            message: format!("tab {} could not be closed", target.tab_id),
-                        },
-                    })
-                    .unwrap();
-                }
-                self.state.remove_unattached_terminal_ids(terminal_ids);
-                self.schedule_session_save();
-                self.emit_event(crate::api::schema::EventEnvelope {
-                    event: crate::api::schema::EventKind::TabClosed,
-                    data: crate::api::schema::EventData::TabClosed {
-                        tab_id: target.tab_id,
-                        workspace_id: self.public_workspace_id(ws_idx),
-                    },
-                });
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::Ok {},
-                }
-            }
-            Method::AgentList(_) => SuccessResponse {
-                id: request.id,
-                result: ResponseResult::AgentList {
-                    agents: self.collect_agent_infos(),
-                },
-            },
-            Method::AgentGet(target) => {
-                let agent = match self.agent_info_for_target(&target.target) {
-                    Ok(agent) => agent,
-                    Err(err) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: self.agent_target_error_body(err),
-                        })
-                        .unwrap();
-                    }
-                };
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::AgentInfo { agent },
-                }
-            }
-            Method::AgentFocus(target) => {
-                let agent = match self.focus_agent_target(&target.target) {
-                    Ok(agent) => agent,
-                    Err(err) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: self.agent_target_error_body(err),
-                        })
-                        .unwrap();
-                    }
-                };
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::AgentInfo { agent },
-                }
-            }
-            Method::AgentRename(params) => {
-                let agent = match self.rename_agent_target(&params.target, params.name) {
-                    Ok(agent) => agent,
-                    Err(err) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: self.agent_rename_error_body(err),
-                        })
-                        .unwrap();
-                    }
-                };
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::AgentInfo { agent },
-                }
-            }
-            Method::AgentStart(params) => {
-                let (agent, argv) = match self.start_agent(params) {
-                    Ok(started) => started,
-                    Err(err) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: self.agent_start_error_body(err),
-                        })
-                        .unwrap();
-                    }
-                };
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::AgentStarted { agent, argv },
-                }
-            }
-            Method::AgentRead(params) => {
-                let resolved = match self.resolve_terminal_target(&params.target) {
-                    Ok(resolved) => resolved,
-                    Err(err) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: self.agent_target_error_body(err),
-                        })
-                        .unwrap();
-                    }
-                };
-                let Some((pane, workspace_id)) =
-                    self.lookup_runtime(resolved.ws_idx, resolved.pane_id)
-                else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "agent_not_found".into(),
-                            message: format!("agent target {} not found", params.target),
-                        },
-                    })
-                    .unwrap();
-                };
-                let requested_lines = params.lines.unwrap_or(80).min(1000) as usize;
-                let text = match params.format {
-                    ReadFormat::Text => match params.source {
-                        ReadSource::Visible => pane.visible_text(),
-                        ReadSource::Recent => pane.recent_text(requested_lines),
-                        ReadSource::RecentUnwrapped => pane.recent_unwrapped_text(requested_lines),
-                    },
-                    ReadFormat::Ansi => match params.source {
-                        ReadSource::Visible => pane.visible_ansi(),
-                        ReadSource::Recent => pane.recent_ansi(requested_lines),
-                        ReadSource::RecentUnwrapped => pane.recent_unwrapped_ansi(requested_lines),
-                    },
-                };
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::PaneRead {
-                        read: PaneReadResult {
-                            pane_id: self
-                                .public_pane_id(resolved.ws_idx, resolved.pane_id)
-                                .unwrap_or_else(|| params.target.clone()),
-                            workspace_id,
-                            tab_id: self
-                                .public_tab_id(resolved.ws_idx, resolved.tab_idx)
-                                .unwrap(),
-                            source: params.source,
-                            format: params.format,
-                            text,
-                            revision: 0,
-                            truncated: false,
-                        },
-                    },
-                }
-            }
-            Method::AgentSend(params) => {
-                let resolved = match self.resolve_terminal_target(&params.target) {
-                    Ok(resolved) => resolved,
-                    Err(err) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: self.agent_target_error_body(err),
-                        })
-                        .unwrap();
-                    }
-                };
-                let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id)
-                else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "agent_not_found".into(),
-                            message: format!("agent target {} not found", params.target),
-                        },
-                    })
-                    .unwrap();
-                };
-                if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "agent_send_failed".into(),
-                            message: err.to_string(),
-                        },
-                    })
-                    .unwrap();
-                }
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::Ok {},
-                }
-            }
-            Method::PaneSplit(params) => {
-                let Some((ws_idx, target_pane_id)) = self.parse_pane_id(&params.target_pane_id)
-                else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.target_pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let (rows, cols) = self.state.estimate_pane_size();
-                let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
-                    self.state.workspaces.get(ws_idx).and_then(|ws| {
-                        let tab_idx = ws.find_tab_index_for_pane(target_pane_id)?;
-                        ws.tabs.get(tab_idx)?.cwd_for_pane(
-                            target_pane_id,
-                            &self.state.terminals,
-                            &self.state.terminal_runtimes,
-                        )
-                    })
-                });
-                let default_shell = self.state.default_shell.clone();
-                let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
-                let host_terminal_theme = self.state.host_terminal_theme;
-                let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.target_pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let direction = match params.direction {
-                    crate::api::schema::SplitDirection::Right => {
-                        ratatui::layout::Direction::Horizontal
-                    }
-                    crate::api::schema::SplitDirection::Down => {
-                        ratatui::layout::Direction::Vertical
-                    }
-                };
-                let (target_tab_idx, new_pane) = match ws.split_pane(
-                    target_pane_id,
-                    direction,
-                    rows,
-                    cols,
-                    split_cwd,
-                    scrollback_limit_bytes,
-                    host_terminal_theme,
-                    &default_shell,
-                    params.focus,
-                ) {
-                    Some(Ok(result)) => result,
-                    Some(Err(err)) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "pane_split_failed".into(),
-                                message: err.to_string(),
-                            },
-                        })
-                        .unwrap();
-                    }
-                    None => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "pane_not_found".into(),
-                                message: format!("pane {} not found", params.target_pane_id),
-                            },
-                        })
-                        .unwrap();
-                    }
-                };
-                if params.focus {
-                    self.state.switch_workspace(ws_idx);
-                    self.state.switch_tab(target_tab_idx);
-                    self.state.mode = Mode::Terminal;
-                }
-                self.state
-                    .terminal_runtimes
-                    .insert(new_pane.terminal.id.clone(), new_pane.runtime);
-                self.state
-                    .terminals
-                    .insert(new_pane.terminal.id.clone(), new_pane.terminal);
-                self.schedule_session_save();
-                let pane = self.pane_info(ws_idx, new_pane.pane_id).unwrap();
-                self.emit_event(crate::api::schema::EventEnvelope {
-                    event: crate::api::schema::EventKind::PaneCreated,
-                    data: crate::api::schema::EventData::PaneCreated { pane: pane.clone() },
-                });
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::PaneInfo { pane },
-                }
-            }
-            Method::PaneList(PaneListParams { workspace_id }) => {
-                match self.collect_panes_for_workspace(workspace_id.as_deref()) {
-                    Ok(panes) => SuccessResponse {
-                        id: request.id,
-                        result: ResponseResult::PaneList { panes },
-                    },
-                    Err((code, message)) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody { code, message },
-                        })
-                        .unwrap();
-                    }
-                }
-            }
-            Method::PaneGet(target) => {
-                let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", target.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(pane) = self.pane_info(ws_idx, pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", target.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::PaneInfo { pane },
-                }
-            }
-            Method::PaneRename(params) => {
-                let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(terminal_id) = self
-                    .state
-                    .workspaces
-                    .get(ws_idx)
-                    .and_then(|ws| ws.terminal_id(pane_id))
-                    .cloned()
-                else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                match params.label.map(|label| label.trim().to_string()) {
-                    Some(label) if !label.is_empty() => terminal.set_manual_label(label),
-                    _ => terminal.clear_manual_label(),
-                }
-                self.state.mark_session_dirty();
-                let pane = self.pane_info(ws_idx, pane_id).unwrap();
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::PaneInfo { pane },
-                }
-            }
-            Method::PaneRead(params) => {
-                let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some((pane, workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(tab_idx) = self
-                    .state
-                    .workspaces
-                    .get(ws_idx)
-                    .and_then(|ws| ws.find_tab_index_for_pane(pane_id))
-                else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let requested_lines = params.lines.unwrap_or(80).min(1000) as usize;
-                let text = match params.format {
-                    ReadFormat::Text => match params.source {
-                        ReadSource::Visible => pane.visible_text(),
-                        ReadSource::Recent => pane.recent_text(requested_lines),
-                        ReadSource::RecentUnwrapped => pane.recent_unwrapped_text(requested_lines),
-                    },
-                    ReadFormat::Ansi => match params.source {
-                        ReadSource::Visible => pane.visible_ansi(),
-                        ReadSource::Recent => pane.recent_ansi(requested_lines),
-                        ReadSource::RecentUnwrapped => pane.recent_unwrapped_ansi(requested_lines),
-                    },
-                };
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::PaneRead {
-                        read: PaneReadResult {
-                            pane_id: params.pane_id,
-                            workspace_id,
-                            tab_id: self.public_tab_id(ws_idx, tab_idx).unwrap(),
-                            source: params.source,
-                            format: params.format,
-                            text,
-                            revision: 0,
-                            truncated: false,
-                        },
-                    },
-                }
-            }
+            Method::TabList(params) => return self.handle_tab_list(request.id, params),
+            Method::TabGet(target) => return self.handle_tab_get(request.id, target),
+            Method::TabCreate(params) => return self.handle_tab_create(request.id, params),
+            Method::TabFocus(target) => return self.handle_tab_focus(request.id, target),
+            Method::TabRename(params) => return self.handle_tab_rename(request.id, params),
+            Method::TabClose(target) => return self.handle_tab_close(request.id, target),
+            Method::AgentList(_) => return self.handle_agent_list(request.id),
+            Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
+            Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),
+            Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
+            Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
+            Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
+            Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
+            Method::PaneList(params) => return self.handle_pane_list(request.id, params),
+            Method::PaneGet(target) => return self.handle_pane_get(request.id, target),
+            Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
+            Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneReportAgent(params) => {
-                let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "invalid_agent".into(),
-                            message: "agent label must not be empty".into(),
-                        },
-                    })
-                    .unwrap();
-                };
-                self.handle_internal_event(crate::events::AppEvent::HookStateReported {
-                    pane_id,
-                    source: params.source,
-                    agent_label,
-                    state: detect_state_from_api(params.state),
-                    message: params.message,
-                    custom_status: normalize_custom_status(params.custom_status),
-                    seq: params.seq,
-                });
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::Ok {},
-                }
+                return self.handle_pane_report_agent(request.id, params);
+            }
+            Method::PaneReportMetadata(params) => {
+                return self.handle_pane_report_metadata(request.id, params);
             }
             Method::PaneClearAgentAuthority(params) => {
-                let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                self.handle_internal_event(crate::events::AppEvent::HookAuthorityCleared {
-                    pane_id,
-                    source: params.source,
-                    seq: params.seq,
-                });
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::Ok {},
-                }
+                return self.handle_pane_clear_agent_authority(request.id, params);
             }
             Method::PaneReleaseAgent(params) => {
-                let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "invalid_agent".into(),
-                            message: "agent label must not be empty".into(),
-                        },
-                    })
-                    .unwrap();
-                };
-                self.handle_internal_event(crate::events::AppEvent::HookAgentReleased {
-                    pane_id,
-                    source: params.source,
-                    known_agent: crate::detect::parse_agent_label(&agent_label),
-                    agent_label,
-                    seq: params.seq,
-                });
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::Ok {},
-                }
+                return self.handle_pane_release_agent(request.id, params);
             }
             Method::PaneSetDroidSession(params) => {
                 let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
@@ -1382,273 +611,245 @@ impl App {
                     result: ResponseResult::Ok {},
                 }
             }
-            Method::PaneSendText(params) => {
-                let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_send_failed".into(),
-                            message: err.to_string(),
-                        },
-                    })
-                    .unwrap();
-                }
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::Ok {},
-                }
-            }
+            Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
             Method::PaneSendInput(params) => {
-                let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let encoded_keys = match encode_api_keys(runtime, &params.keys) {
-                    Ok(encoded_keys) => encoded_keys,
-                    Err(key) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "invalid_key".into(),
-                                message: format!("unsupported key {key}"),
-                            },
-                        })
-                        .unwrap();
-                    }
-                };
-                if !params.text.is_empty() {
-                    let text_bytes = encode_api_text(runtime, &params.text);
-                    if let Err(err) = runtime.try_send_bytes(Bytes::from(text_bytes)) {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "pane_send_failed".into(),
-                                message: err.to_string(),
-                            },
-                        })
-                        .unwrap();
-                    }
-                }
-                for bytes in encoded_keys {
-                    if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "pane_send_failed".into(),
-                                message: err.to_string(),
-                            },
-                        })
-                        .unwrap();
-                    }
-                }
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::Ok {},
-                }
+                return self.handle_pane_send_input(request.id, params)
             }
-            Method::PaneClose(target) => {
-                let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", target.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let workspace_id = self.state.workspaces[ws_idx].id.clone();
-                let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
-                let should_close_workspace = {
-                    let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "pane_not_found".into(),
-                                message: format!("pane {} not found", target.pane_id),
-                            },
-                        })
-                        .unwrap();
-                    };
-                    ws.close_pane(pane_id)
-                };
-                if should_close_workspace {
-                    self.state.selected = ws_idx;
-                    self.state.close_selected_workspace();
-                    self.emit_event(crate::api::schema::EventEnvelope {
-                        event: crate::api::schema::EventKind::PaneClosed,
-                        data: crate::api::schema::EventData::PaneClosed {
-                            pane_id: target.pane_id.clone(),
-                            workspace_id: workspace_id.clone(),
-                        },
-                    });
-                    self.emit_event(crate::api::schema::EventEnvelope {
-                        event: crate::api::schema::EventKind::WorkspaceClosed,
-                        data: crate::api::schema::EventData::WorkspaceClosed { workspace_id },
-                    });
-                } else {
-                    self.state.remove_unattached_terminal_ids(terminal_id);
-                    self.schedule_session_save();
-                    self.emit_event(crate::api::schema::EventEnvelope {
-                        event: crate::api::schema::EventKind::PaneClosed,
-                        data: crate::api::schema::EventData::PaneClosed {
-                            pane_id: target.pane_id,
-                            workspace_id,
-                        },
-                    });
-                }
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::Ok {},
-                }
-            }
-            Method::PaneSendKeys(params) => {
-                let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-                    return serde_json::to_string(&ErrorResponse {
-                        id: request.id,
-                        error: ErrorBody {
-                            code: "pane_not_found".into(),
-                            message: format!("pane {} not found", params.pane_id),
-                        },
-                    })
-                    .unwrap();
-                };
-                let encoded_keys = match encode_api_keys(runtime, &params.keys) {
-                    Ok(encoded_keys) => encoded_keys,
-                    Err(key) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "invalid_key".into(),
-                                message: format!("unsupported key {key}"),
-                            },
-                        })
-                        .unwrap();
-                    }
-                };
-                for bytes in encoded_keys {
-                    if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "pane_send_failed".into(),
-                                message: err.to_string(),
-                            },
-                        })
-                        .unwrap();
-                    }
-                }
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::Ok {},
-                }
-            }
+            Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
+            Method::PaneSendKeys(params) => return self.handle_pane_send_keys(request.id, params),
             Method::IntegrationInstall(params) => {
-                let target = params.target;
-                let messages = match crate::integration::install_target(target) {
-                    Ok(messages) => messages,
-                    Err(err) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "integration_install_failed".into(),
-                                message: err.to_string(),
-                            },
-                        })
-                        .unwrap();
-                    }
-                };
-
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::IntegrationInstall {
-                        target,
-                        details: IntegrationInstallResult { messages },
-                    },
-                }
+                return self.handle_integration_install(request.id, params);
             }
             Method::IntegrationUninstall(params) => {
-                let target = params.target;
-                let messages = match crate::integration::uninstall_target(target) {
-                    Ok(messages) => messages,
-                    Err(err) => {
-                        return serde_json::to_string(&ErrorResponse {
-                            id: request.id,
-                            error: ErrorBody {
-                                code: "integration_uninstall_failed".into(),
-                                message: err.to_string(),
-                            },
-                        })
-                        .unwrap();
-                    }
-                };
-
-                SuccessResponse {
-                    id: request.id,
-                    result: ResponseResult::IntegrationUninstall {
-                        target,
-                        details: IntegrationUninstallResult { messages },
-                    },
-                }
+                return self.handle_integration_uninstall(request.id, params);
             }
             _ => {
-                return serde_json::to_string(&ErrorResponse {
-                    id: request.id,
-                    error: ErrorBody {
-                        code: "not_implemented".into(),
-                        message: "method not implemented yet".into(),
-                    },
-                })
-                .unwrap();
+                return responses::encode_error(
+                    request.id,
+                    "not_implemented",
+                    "method not implemented yet",
+                );
             }
         };
 
         serde_json::to_string(&response).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::{Agent, AgentState};
+
+    fn init_repo(path: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed for {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn herdr_toast_context_uses_live_root_runtime_cwd_label() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let mut workspace = crate::workspace::Workspace::test_new("stale");
+        workspace.custom_name = None;
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(root).cloned().unwrap();
+        let temp_root = std::env::temp_dir().join(format!(
+            "herdr-toast-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stale_cwd = temp_root.join("__herdr_original__");
+        let live_cwd = temp_root.join("__herdr_projects__");
+        std::fs::create_dir_all(&stale_cwd).unwrap();
+        std::fs::create_dir_all(&live_cwd).unwrap();
+        init_repo(&stale_cwd);
+        init_repo(&live_cwd);
+
+        workspace.identity_cwd = stale_cwd.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = stale_cwd;
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+
+        let (events, _) = tokio::sync::mpsc::channel(4);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            root,
+            24,
+            80,
+            live_cwd.clone(),
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runtime.cwd() != Some(live_cwd.clone()) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: root,
+            agent: Some(Agent::Codex),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: root,
+            agent: Some(Agent::Codex),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.context.as_str()),
+            Some("__herdr_projects__ · 1")
+        );
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn pane_died_respawns_shell_and_clears_restored_agent_session() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("restored");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal should exist");
+        terminal.respawn_shell_on_exit = true;
+        terminal.set_agent_name("codex".into());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("codex-session")
+                .expect("test session id should be valid"),
+        });
+
+        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+
+        assert!(
+            app.find_pane(pane_id).is_some(),
+            "respawnable agent pane should stay attached after the agent process exits"
+        );
+        let terminal = app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .expect("terminal should survive respawn");
+        assert!(!terminal.respawn_shell_on_exit);
+        assert!(terminal.persisted_agent_session.is_none());
+        assert!(terminal.agent_name.is_none());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[test]
+    fn terminal_delivery_does_not_refresh_existing_targeted_toast() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.local_terminal_notifications = false;
+
+        let mut workspace = crate::workspace::Workspace::test_new("stale");
+        workspace.custom_name = None;
+        workspace.identity_cwd = "/__herdr_original__".into();
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(root).cloned().unwrap();
+        let workspace_id = workspace.id.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = "/__herdr_projects__".into();
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Terminal;
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: root,
+            agent: Some(Agent::Codex),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: ToastKind::Finished,
+            title: "codex finished".into(),
+            context: "__herdr_original__ · 1".into(),
+            target: Some(crate::app::state::ToastTarget {
+                workspace_id,
+                pane_id: root,
+            }),
+        });
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id: root,
+            agent: Some(Agent::Codex),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.context.as_str()),
+            Some("__herdr_original__ · 1")
+        );
     }
 }

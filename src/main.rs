@@ -18,6 +18,7 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
     "recursion detected. base case not found. aborting.",
 ];
 
+mod agent_resume;
 mod api;
 mod app;
 mod cli;
@@ -26,6 +27,7 @@ mod config;
 mod detect;
 mod events;
 mod ghostty;
+mod handoff_runtime;
 mod input;
 mod integration;
 mod ipc;
@@ -36,6 +38,8 @@ mod pane;
 mod persist;
 mod platform;
 mod product_announcements;
+mod protocol;
+mod pty;
 mod raw_input;
 mod release_notes;
 mod remote;
@@ -49,6 +53,7 @@ mod terminal_theme;
 mod ui;
 mod update;
 mod workspace;
+mod worktree;
 
 fn init_logging() {
     crate::logging::init_file_logging("herdr.log");
@@ -80,57 +85,94 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Empty means $SHELL, then /bin/sh.
 # default_shell = ""
 
+# Startup mode for new interactive pane shells: "auto", "login", or "non_login".
+# "auto" uses login shells on macOS and keeps the current behavior elsewhere.
+# shell_mode = "auto"
+
+# CWD policy for new panes, tabs, and workspaces when no explicit --cwd is provided.
+# Use "follow" to inherit the source pane/workspace, "home" for $HOME,
+# "current" for Herdr's process directory, or a fixed path such as "~/Projects".
+# new_cwd = "follow"
+
 [keys]
-# Prefix key to enter navigate mode (default: "ctrl+b")
+# Prefix key to enter prefix mode (default: "ctrl+b")
 # Examples: "ctrl+b", "f12", "esc", "-"
-# Accepted syntax: plain keys, ctrl/shift/alt/cmd/super modifiers, and special keys like enter/tab/esc/left/right/up/down
-# Most reliable bindings are plain keys, ctrl+letter, esc/tab/enter, and function keys.
+# Action bindings use explicit syntax: "prefix+n" requires the prefix;
+# "ctrl+alt+n" is a direct terminal-mode shortcut.
+# Accepted key syntax: plain keys, ctrl/shift/alt/cmd/super modifiers, and special keys like enter/tab/esc/left/right/up/down.
+# Named punctuation such as minus, comma, ampersand, plus, and backtick is also accepted.
+# Most reliable direct bindings are ctrl+letter, function keys, and explicit modified chords.
 # alt+..., cmd/super, and punctuation-with-modifiers may depend on your terminal/tmux setup.
 # prefix = "ctrl+b"
 
-# Navigate-mode actions
-# new_workspace = "n"
-# rename_workspace = "shift+n"
-# close_workspace = "shift+d"
+# Prefix-mode actions
+# help = "prefix+?"
+# settings = "prefix+s"
+# detach = "prefix+q"
+# reload_config = "prefix+shift+r"
+# open_notification_target = "prefix+o"
+# workspace_picker = "prefix+w"
+# goto = "prefix+g"
+# new_workspace = "prefix+shift+n"
+# new_worktree = "prefix+shift+g"
+# open_worktree = ""    # optional, unset by default
+# remove_worktree = ""  # optional, unset by default; opens confirmation
+# rename_workspace = "prefix+shift+w"
+# close_workspace = "prefix+shift+d"
 # previous_workspace = "" # optional, unset by default
 # next_workspace = ""     # optional, unset by default
 # previous_agent = ""     # optional, unset by default
 # next_agent = ""         # optional, unset by default
-# detach = ""             # optional explicit detach shortcut in server/client mode
-# reload_config = ""      # optional shortcut to reload config.toml without restarting
-# open_notification_target = "" # optional shortcut to jump to the visible notification target
-# new_tab = "c"
-# rename_tab = ""         # optional, unset by default
-# previous_tab = ""       # optional, unset by default
-# next_tab = ""           # optional, unset by default
-# close_tab = ""          # optional, unset by default
-# rename_pane = ""        # optional, unset by default
-# edit_scrollback = ""    # optional, opens focused pane scrollback in $EDITOR
-# focus_pane_left = ""    # optional, unset by default
-# focus_pane_down = ""    # optional, unset by default
-# focus_pane_up = ""      # optional, unset by default
-# focus_pane_right = ""   # optional, unset by default
-# split_vertical = "v"
-# split_horizontal = "-"
-# close_pane = "x"
-# zoom = "f"             # legacy alias: fullscreen
-# resize_mode = "r"
-# toggle_sidebar = "b"
+# focus_agent = ""        # optional indexed binding, e.g. "prefix+alt+1..9"
+# new_tab = "prefix+c"
+# rename_tab = "prefix+shift+t"
+# previous_tab = "prefix+p"
+# next_tab = "prefix+n"
+# switch_tab = "prefix+1..9"
+# switch_workspace = ""   # optional indexed binding, e.g. "prefix+shift+1..9"
+# close_tab = "prefix+shift+x"
+# rename_pane = "prefix+shift+p"
+# edit_scrollback = "prefix+e"
+# focus_pane_left = "prefix+h"
+# focus_pane_down = "prefix+j"
+# focus_pane_up = "prefix+k"
+# focus_pane_right = "prefix+l"
+# cycle_pane_next = "prefix+tab"
+# cycle_pane_previous = "prefix+shift+tab"
+# last_pane = ""          # optional, unset by default; bind e.g. "prefix+tab" for global back-and-forth
+# split_vertical = "prefix+v"
+# split_horizontal = "prefix+minus"
+# close_pane = "prefix+x"
+# zoom = "prefix+z"       # legacy alias: fullscreen
+# resize_mode = "prefix+r"
+# toggle_sidebar = "prefix+b"
 
-# Custom prefix-mode commands. Press prefix, then the configured key.
+# Navigate-mode movement. These local shortcuts win while navigate mode is open.
+# They are independent from focus_pane_*. Do not include prefix+, esc, enter, tab, or 1..9 here.
+# navigate_workspace_up = "up"
+# navigate_workspace_down = "down"
+# navigate_pane_left = "h"      # left arrow always focuses the pane to the left
+# navigate_pane_down = "j"
+# navigate_pane_up = "k"
+# navigate_pane_right = "l"     # right arrow always focuses the pane to the right
+
+# Custom commands use the same binding syntax.
 # type = "shell" runs detached in the background.
 # type = "pane" opens a temporary pane and closes it when the command exits.
 # [[keys.command]]
-# key = "g"
+# key = "prefix+alt+g"
 # type = "pane"
 # command = "lazygit"
 
-# Optional modifier-only shortcuts expanded over number keys 1-9.
-# Empty means disabled. Examples: "ctrl", "ctrl+shift", "alt".
+# Legacy indexed shortcut config is still parsed for compatibility.
+# Prefer switch_tab, switch_workspace, and focus_agent for new configs.
 # [keys.indexed]
-# tabs = ""       # e.g. "ctrl" makes ctrl+1..9 switch tabs
-# workspaces = "" # e.g. "ctrl+shift" makes ctrl+shift+1..9 switch workspaces
-# agents = ""     # e.g. "alt" makes alt+1..9 focus agent rows
+# tabs = ""       # e.g. "ctrl" makes ctrl+1..9 switch tabs directly
+# workspaces = "" # e.g. "ctrl+shift" makes ctrl+shift+1..9 switch workspaces directly
+# agents = ""     # e.g. "alt" makes alt+1..9 focus agent rows directly
+
+# [worktrees]
+# directory = "~/.herdr/worktrees"
 
 [ui]
 # Sidebar width (auto-scaled based on workspace names, this sets the default)
@@ -142,10 +184,22 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Maximum sidebar width when expanded (columns)
 # sidebar_max_width = 36
 
+# Terminal width at or below which Herdr uses the mobile single-column layout.
+# Increase this for foldables, tablets, or wide phone terminals.
+# mobile_width_threshold = 64
+
 # Capture mouse input for Herdr's mouse UI.
 # Set false to let the terminal handle normal clicks, such as Cmd-clicking URLs.
 # Pane apps like lazygit and btop can still receive mouse when they request it.
 # mouse_capture = true
+
+# Force a full redraw when the outer terminal regains focus.
+# Set false to reduce visible flashing when switching back to Herdr.
+# Trade-off: rare host terminal surface corruption may persist until the next full redraw.
+# redraw_on_focus_gained = true
+
+# Pane scrollback lines to scroll per mouse wheel notch.
+# mouse_scroll_lines = 3
 
 # Ask for confirmation before closing a workspace
 # confirm_close = true
@@ -185,12 +239,33 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # [ui.sound.agents]
 # droid = "off"
 
+[session]
+# Resume supported AI-agent panes into their native conversation sessions after
+# a Herdr server restart. Requires official integrations that report session refs.
+# resume_agents_on_restore = false
+
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
 # allow_nested = false
 # Experimental local Kitty graphics rendering for attached clients.
 # Requires a Kitty graphics-compatible outer terminal.
 # kitty_graphics = false
+# Save recent pane screen history across full server restarts.
+pane_history = false
+# Expose the focused pane's cursor to the outer terminal so macOS input
+# methods keep tracking the candidate window when TUIs paint their own
+# cursor (Claude Code, pi, codex). Trade-off: extra cursor visible for
+# apps that hide it without painting a replacement (vim normal mode, etc.).
+# reveal_hidden_cursor_for_cjk_ime = false
+# Optional allow-list: only reveal for focused panes whose detected agent
+# matches one of these names. Empty means apply to any focused pane.
+# If the list contains no valid names, the reveal does not apply.
+# Accepted: pi, claude, codex, gemini, cursor, cline, opencode, copilot,
+# kimi, kiro, droid, amp, grok, hermes, qodercli, qoder.
+# cjk_ime_agents = []
+# Cursor shape rendered when reveal_hidden_cursor_for_cjk_ime is true.
+# Values: block, steady_block (default), underline, steady_underline, bar, steady_bar.
+# cjk_ime_cursor_shape = "steady_block"
 
 [advanced]
 # Maximum scrollback buffer size in bytes retained per pane terminal.
@@ -281,7 +356,19 @@ fn main() -> io::Result<()> {
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("update") {
-        match update::self_update() {
+        let options = match update::parse_self_update_args(&args[2..]) {
+            Ok(options) => options,
+            Err(err) if err.starts_with("usage:") => {
+                eprintln!("{err}");
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                eprintln!("usage: herdr update [--handoff]");
+                std::process::exit(2);
+            }
+        };
+        match update::self_update(options) {
             Ok(_) => return Ok(()),
             Err(e) => {
                 if e.starts_with("self-update is disabled") {
@@ -301,10 +388,12 @@ fn main() -> io::Result<()> {
         println!("       herdr --session <name> [options]");
         println!("       herdr --remote <ssh-target> [--session <name>]");
         println!("       herdr session attach <name>");
-        println!("       herdr update");
+        println!("       herdr update [--handoff]");
         println!("       herdr server stop");
         println!("       herdr server reload-config");
+        println!("       herdr config <subcommand> ...");
         println!("       herdr workspace <subcommand> ...");
+        println!("       herdr worktree <subcommand> ...");
         println!("       herdr tab <subcommand> ...");
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
@@ -329,8 +418,16 @@ fn main() -> io::Result<()> {
                 "Reload config.toml in the running server",
             ),
             (
+                "herdr config reset-keys",
+                "Back up config.toml and remove custom keybindings",
+            ),
+            (
                 "herdr workspace <subcommand>",
                 "Workspace helpers over the socket API",
+            ),
+            (
+                "herdr worktree <subcommand>",
+                "Git worktree helpers over the socket API",
             ),
             ("herdr tab <subcommand>", "Tab helpers over the socket API"),
             (
@@ -364,6 +461,9 @@ fn main() -> io::Result<()> {
         println!("  --no-session        Run monolithically (no server/client, escape hatch)");
         println!("  --session <name>    Use or create a named persistent session");
         println!("  --remote <target>   Attach through SSH to a remote Herdr server");
+        println!("  --remote-keybindings <local|server>");
+        println!("                      Keybindings for --remote app attach (default: local)");
+        println!("  --handoff           Opt into live handoff for update or remote attach");
         println!("  --default-config    Print default configuration and exit");
         println!("  --version, -V       Print version and exit");
         println!("  --help, -h          Show this help");
@@ -390,6 +490,7 @@ fn main() -> io::Result<()> {
         "--no-session",
         "--session",
         "--remote",
+        "--remote-keybindings",
         "--version",
         "-V",
         "--default-config",
@@ -397,7 +498,8 @@ fn main() -> io::Result<()> {
         "-h",
     ];
     for arg in &args[1..] {
-        if arg.starts_with('-') && !known_flags.contains(&arg.as_str()) {
+        let arg_name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
+        if arg.starts_with('-') && !known_flags.contains(&arg_name) {
             eprintln!("unknown option: {arg}");
             eprintln!("run 'herdr --help' for usage");
             std::process::exit(1);
@@ -409,7 +511,9 @@ fn main() -> io::Result<()> {
                 "remote-client-bridge",
                 "update",
                 "status",
+                "config",
                 "workspace",
+                "worktree",
                 "pane",
                 "wait",
                 "session",
@@ -449,7 +553,7 @@ fn main() -> io::Result<()> {
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
-    let _api_server = match api::start_server(api_tx, event_hub.clone()) {
+    let _api_server = match api::start_server_with_capabilities(api_tx, event_hub.clone(), None) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: herdr is already running");

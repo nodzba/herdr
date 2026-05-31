@@ -6,14 +6,14 @@ use ratatui::{
     Frame,
 };
 
-use super::sidebar::{agent_panel_entries, AgentPanelEntry};
+use super::sidebar::{agent_panel_entries, agent_panel_entries_from, AgentPanelEntry};
 use super::status::{agent_icon, state_dot};
 use crate::app::state::{Palette, ToastKind, ToastNotification};
 use crate::app::AppState;
 use crate::detect::AgentState;
 use crate::layout::PaneId;
+use crate::terminal::TerminalRuntimeRegistry;
 
-pub(crate) const MOBILE_WIDTH_THRESHOLD: u16 = 64;
 const SWITCH_BUTTON_WIDTH: u16 = 10;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -41,8 +41,8 @@ pub(crate) enum MobileSwitcherTarget {
     Menu(usize),
 }
 
-pub(crate) fn is_mobile_width(area: Rect) -> bool {
-    area.width > 0 && area.width <= MOBILE_WIDTH_THRESHOLD
+pub(crate) fn is_mobile_width(area: Rect, threshold: u16) -> bool {
+    area.width > 0 && area.width <= threshold
 }
 
 pub(crate) fn compute_mobile_header_hit_areas(_app: &AppState, area: Rect) -> MobileHeaderHitAreas {
@@ -156,7 +156,12 @@ pub(crate) fn mobile_switcher_target_at(
     (menu_idx < app.global_menu_labels().len()).then_some(MobileSwitcherTarget::Menu(menu_idx))
 }
 
-pub(crate) fn render_mobile_header(app: &AppState, frame: &mut Frame, area: Rect) {
+pub(crate) fn render_mobile_header(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    area: Rect,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -168,7 +173,7 @@ pub(crate) fn render_mobile_header(app: &AppState, frame: &mut Frame, area: Rect
     let status_w = switch.x.saturating_sub(area.x).saturating_sub(1);
     let status = Rect::new(area.x, area.y, status_w, area.height);
 
-    render_header_status(app, frame, status);
+    render_header_status(app, terminal_runtimes, frame, status);
     render_switch_button(app, frame, switch);
 }
 
@@ -224,7 +229,12 @@ pub(crate) fn render_mobile_toast_banner(
     );
 }
 
-pub(crate) fn render_mobile_panel(app: &AppState, frame: &mut Frame, area: Rect) {
+pub(crate) fn render_mobile_panel(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    area: Rect,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -253,10 +263,15 @@ pub(crate) fn render_mobile_panel(app: &AppState, frame: &mut Frame, area: Rect)
         );
     }
 
-    render_mobile_switcher_content(app, frame, areas.viewport);
+    render_mobile_switcher_content(app, terminal_runtimes, frame, areas.viewport);
 }
 
-fn render_header_status(app: &AppState, frame: &mut Frame, area: Rect) {
+fn render_header_status(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    area: Rect,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -287,7 +302,7 @@ fn render_header_status(app: &AppState, frame: &mut Frame, area: Rect) {
             Span::raw(" "),
             Span::styled(
                 truncate(
-                    &ws.display_name_from(&app.terminals, &app.terminal_runtimes),
+                    &ws.display_name_from(&app.terminals, terminal_runtimes),
                     name_w.saturating_sub(4) as usize,
                 ),
                 Style::default()
@@ -388,7 +403,12 @@ fn mobile_switcher_content_height(app: &AppState) -> usize {
     spaces_h + tabs_h + agents_h + menu_h
 }
 
-fn render_mobile_switcher_content(app: &AppState, frame: &mut Frame, viewport: Rect) {
+fn render_mobile_switcher_content(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    viewport: Rect,
+) {
     if viewport.width == 0 || viewport.height == 0 {
         return;
     }
@@ -441,7 +461,7 @@ fn render_mobile_switcher_content(app: &AppState, frame: &mut Frame, viewport: R
             Span::styled(" ", Style::default().bg(bg)),
             Span::styled(
                 truncate(
-                    &ws.display_name_from(&app.terminals, &app.terminal_runtimes),
+                    &ws.display_name_from(&app.terminals, terminal_runtimes),
                     content.width.saturating_sub(5) as usize,
                 ),
                 Style::default()
@@ -527,7 +547,7 @@ fn render_mobile_switcher_content(app: &AppState, frame: &mut Frame, viewport: R
         ws.focused_pane_id()
             .map(|pane_id| (ws_idx, ws.active_tab, pane_id))
     });
-    let entries = agent_panel_entries(app);
+    let entries = agent_panel_entries_from(app, terminal_runtimes);
     render_section_title_at(
         frame,
         viewport,
@@ -601,7 +621,15 @@ fn mobile_agent_detail(entry: &AgentPanelEntry) -> String {
     if let Some(tab_label) = entry.primary_tab_label.as_deref() {
         parts.push(tab_label.to_string());
     }
-    parts.push(super::status::state_label(entry.state, entry.seen).to_string());
+    let status = entry
+        .state_labels
+        .get(super::sidebar::agent_panel_status_key(
+            entry.state,
+            entry.seen,
+        ))
+        .cloned()
+        .unwrap_or_else(|| super::status::state_label(entry.state, entry.seen).to_string());
+    parts.push(status);
     if let Some(agent_label) = entry.agent_label.as_deref() {
         parts.push(agent_label.to_string());
     }
@@ -921,6 +949,7 @@ mod tests {
             custom_status: None,
             droid_session_id: None,
             pi_session_file: None,
+            state_labels: std::collections::HashMap::new(),
         }
     }
 
@@ -936,5 +965,82 @@ mod tests {
         let entry = agent_entry(None, Some("pi"));
 
         assert_eq!(mobile_agent_detail(&entry), "  idle · pi");
+    }
+
+    #[tokio::test]
+    async fn mobile_header_uses_live_root_runtime_cwd_for_workspace_label() {
+        let unique = format!(
+            "herdr-mobile-header-runtime-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let stale_cwd = root.join("issue-264-nix-support");
+        let live_cwd = root.join("herdr");
+        std::fs::create_dir_all(stale_cwd.join(".git")).unwrap();
+        std::fs::create_dir_all(live_cwd.join(".git")).unwrap();
+
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = crate::workspace::Workspace::test_new("stale-name");
+        workspace.custom_name = None;
+        workspace.identity_cwd = stale_cwd.clone();
+        let pane = workspace.tabs[0].root_pane;
+
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&terminal_id).unwrap().cwd = stale_cwd;
+        app.active = Some(0);
+        app.selected = 0;
+        app.view.mobile_menu_hit_area = Rect::new(30, 0, 10, 2);
+
+        let (events, _) = tokio::sync::mpsc::channel(4);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            pane,
+            24,
+            80,
+            live_cwd.clone(),
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runtime.cwd() != Some(live_cwd.clone()) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut runtime_registry = TerminalRuntimeRegistry::new();
+        runtime_registry.insert(terminal_id, runtime);
+        let backend = ratatui::backend::TestBackend::new(40, 2);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_mobile_header(&app, &runtime_registry, frame, Rect::new(0, 0, 40, 2))
+            })
+            .unwrap();
+        let row = (0..40)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+
+        for (_, runtime) in runtime_registry.drain() {
+            runtime.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(row.contains("herdr"), "header row: {row:?}");
+        assert!(
+            !row.contains("issue-264-nix-support"),
+            "header row: {row:?}"
+        );
     }
 }

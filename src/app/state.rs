@@ -1,8 +1,9 @@
-use crate::config::{Keybinds, SoundConfig, ToastConfig, ToastDelivery};
+use crate::config::{Keybinds, NewTerminalCwdConfig, SoundConfig, ToastConfig, ToastDelivery};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
 
+use crate::detect::AgentState;
 use crate::layout::{PaneId, PaneInfo, SplitBorder};
 use crate::selection::Selection;
 
@@ -557,6 +558,150 @@ impl Palette {
 pub struct WorkspaceCardArea {
     pub ws_idx: usize,
     pub rect: Rect,
+    pub indented: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeCreateState {
+    pub source_workspace_id: String,
+    pub source_checkout_path: std::path::PathBuf,
+    pub source_existing_membership: Option<crate::workspace::WorktreeSpaceMembership>,
+    pub source_repo_root: std::path::PathBuf,
+    pub repo_key: String,
+    pub repo_name: String,
+    pub branch: String,
+    pub checkout_path: std::path::PathBuf,
+    pub error: Option<String>,
+    pub creating: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRemoveState {
+    pub workspace_id: String,
+    pub repo_root: std::path::PathBuf,
+    pub path: std::path::PathBuf,
+    pub error: Option<String>,
+    pub removing: bool,
+    pub force_confirmation: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeOpenEntry {
+    pub path: std::path::PathBuf,
+    pub branch: Option<String>,
+    pub is_linked_worktree: bool,
+    pub already_open_ws_idx: Option<usize>,
+}
+
+impl WorktreeOpenEntry {
+    pub(crate) fn display_name(&self) -> String {
+        self.branch.clone().unwrap_or_else(|| {
+            self.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.path.display().to_string())
+        })
+    }
+
+    pub(crate) fn status_label(&self) -> &'static str {
+        if self.already_open_ws_idx.is_some() {
+            "open"
+        } else if self.branch.is_some() {
+            ""
+        } else if self.is_linked_worktree {
+            "detached"
+        } else {
+            "root"
+        }
+    }
+
+    fn search_text(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.display_name(),
+            self.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+            self.path.display(),
+            self.status_label()
+        )
+        .to_lowercase()
+    }
+
+    fn matches_query(&self, query: &str) -> bool {
+        text_matches_query(query, &self.search_text())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeOpenState {
+    pub source_workspace_id: String,
+    pub source_existing_membership: Option<crate::workspace::WorktreeSpaceMembership>,
+    pub source_checkout_path: std::path::PathBuf,
+    pub source_repo_root: std::path::PathBuf,
+    pub repo_key: String,
+    pub repo_name: String,
+    pub entries: Vec<WorktreeOpenEntry>,
+    pub selected: usize,
+    pub query: String,
+    pub search_focused: bool,
+    pub error: Option<String>,
+}
+
+impl WorktreeOpenState {
+    pub(crate) fn filtered_indices(&self) -> Vec<usize> {
+        let query = self.query.trim();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                (query.is_empty() || entry.matches_query(query)).then_some(idx)
+            })
+            .collect()
+    }
+
+    pub(crate) fn selected_entry_index(&self) -> Option<usize> {
+        let indices = self.filtered_indices();
+        if indices.contains(&self.selected) {
+            Some(self.selected)
+        } else {
+            indices.first().copied()
+        }
+    }
+
+    pub(crate) fn normalize_selection(&mut self) {
+        if let Some(selected) = self.selected_entry_index() {
+            self.selected = selected;
+        }
+    }
+
+    pub(crate) fn select_previous_filtered(&mut self) {
+        let indices = self.filtered_indices();
+        let Some(current) = self.selected_entry_index() else {
+            return;
+        };
+        let pos = indices.iter().position(|idx| *idx == current).unwrap_or(0);
+        self.selected = indices[pos.saturating_sub(1)];
+    }
+
+    pub(crate) fn select_next_filtered(&mut self) {
+        let indices = self.filtered_indices();
+        let Some(current) = self.selected_entry_index() else {
+            return;
+        };
+        let pos = indices.iter().position(|idx| *idx == current).unwrap_or(0);
+        self.selected = indices[(pos + 1).min(indices.len().saturating_sub(1))];
+    }
+}
+
+pub(crate) fn text_matches_query(query: &str, text: &str) -> bool {
+    let haystack = text.to_lowercase();
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .all(|needle| haystack.contains(needle))
 }
 
 /// Computed view geometry — derived from AppState + terminal size.
@@ -590,16 +735,79 @@ pub enum Mode {
     ReleaseNotes,
     ProductAnnouncement,
     Navigate,
+    Prefix,
+    Copy,
     Terminal,
     RenameWorkspace,
     RenameTab,
     RenamePane,
+    NewLinkedWorktree,
+    OpenExistingWorktree,
+    ConfirmRemoveWorktree,
     Resize,
     ConfirmClose,
     ContextMenu,
     Settings,
     GlobalMenu,
     KeybindHelp,
+    Navigator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NavigatorTarget {
+    Workspace {
+        ws_idx: usize,
+    },
+    Tab {
+        ws_idx: usize,
+        tab_idx: usize,
+    },
+    Pane {
+        ws_idx: usize,
+        tab_idx: usize,
+        pane_id: PaneId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NavigatorRow {
+    pub target: NavigatorTarget,
+    pub depth: u8,
+    pub label: String,
+    pub meta: String,
+    pub status: AgentState,
+    pub seen: bool,
+    pub is_current: bool,
+    pub is_workspace: bool,
+    pub is_tab: bool,
+    pub expanded: bool,
+    pub search_text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NavigatorStateFilter {
+    Blocked,
+    Working,
+    Idle,
+    Done,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NavigatorState {
+    pub query: String,
+    pub selected: usize,
+    pub scroll: usize,
+    pub search_focused: bool,
+    pub state_filter: Option<NavigatorStateFilter>,
+    pub expanded_workspaces: std::collections::HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CopyModeState {
+    pub pane_id: PaneId,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub selecting: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -620,6 +828,7 @@ pub enum SettingsSection {
     Sound,
     Toast,
     PaneLabels,
+    Experiments,
     Integrations,
 }
 
@@ -630,6 +839,7 @@ impl SettingsSection {
         Self::Toast,
         Self::PaneLabels,
         Self::Integrations,
+        Self::Experiments,
     ];
 
     pub fn label(self) -> &'static str {
@@ -638,6 +848,7 @@ impl SettingsSection {
             Self::Sound => "sound",
             Self::Toast => "toasts",
             Self::PaneLabels => "pane labels",
+            Self::Experiments => "experiments",
             Self::Integrations => "integrations",
         }
     }
@@ -784,10 +995,16 @@ pub(crate) struct TabPressState {
     pub start_row: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuKind {
     Workspace {
         ws_idx: usize,
+    },
+    GitWorkspace {
+        ws_idx: usize,
+        is_linked_worktree: bool,
+        has_worktree_children: bool,
+        collapsed: bool,
     },
     Tab {
         ws_idx: usize,
@@ -811,6 +1028,39 @@ impl ContextMenuState {
     pub fn items(&self) -> &'static [&'static str] {
         match self.kind {
             ContextMenuKind::Workspace { .. } => &["Rename", "Close"],
+            ContextMenuKind::GitWorkspace {
+                is_linked_worktree: false,
+                has_worktree_children: false,
+                ..
+            } => &["Rename", "Close", "New worktree", "Open worktree..."],
+            ContextMenuKind::GitWorkspace {
+                is_linked_worktree: true,
+                ..
+            } => &["Rename", "Close", "Delete worktree checkout..."],
+            ContextMenuKind::GitWorkspace {
+                is_linked_worktree: false,
+                has_worktree_children: true,
+                collapsed: true,
+                ..
+            } => &[
+                "Rename",
+                "Close group",
+                "New worktree",
+                "Open worktree...",
+                "Expand",
+            ],
+            ContextMenuKind::GitWorkspace {
+                is_linked_worktree: false,
+                has_worktree_children: true,
+                collapsed: false,
+                ..
+            } => &[
+                "Rename",
+                "Close group",
+                "New worktree",
+                "Open worktree...",
+                "Collapse",
+            ],
             ContextMenuKind::Tab { .. } => &["New tab", "Rename", "Close"],
             ContextMenuKind::Pane {
                 has_manual_label: true,
@@ -858,6 +1108,11 @@ pub struct ToastNotification {
     pub target: Option<ToastTarget>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyFeedback {
+    pub message: String,
+}
+
 pub struct ReleaseNotesState {
     pub version: String,
     pub body: String,
@@ -885,43 +1140,63 @@ pub enum SidebarWidthSource {
     Manual,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneFocusTarget {
+    pub workspace_id: String,
+    pub pane_id: PaneId,
+}
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
     pub terminals:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
-    pub terminal_runtimes:
-        std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalRuntime>,
     /// Terminal ids whose size is currently owned by a direct attach client.
     pub direct_attach_resize_locks: std::collections::HashSet<crate::terminal::TerminalId>,
+    pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub workspaces: Vec<Workspace>,
     pub active: Option<usize>,
+    pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
     pub selected: usize,
     pub mode: Mode,
     pub should_quit: bool,
-    /// In persistence mode, client quit actions detach instead of stopping the server.
-    pub quit_detaches: bool,
+    /// In monolithic --no-session mode, detach exits the app because there is no server to detach from.
+    pub detach_exits: bool,
     /// Set when the current client should detach from the persistent session.
     /// The server's event loop checks this and handles client detach.
     pub detach_requested: bool,
     pub request_new_workspace: bool,
     pub request_new_tab: bool,
+    pub request_new_linked_worktree: Option<usize>,
+    pub request_open_existing_worktree: Option<usize>,
+    pub request_new_workspace_cwd: Option<std::path::PathBuf>,
+    pub request_remove_linked_worktree: Option<usize>,
+    pub request_submit_worktree_create: bool,
+    pub request_submit_worktree_open: bool,
+    pub request_submit_worktree_remove: bool,
     pub request_reload_config: bool,
     /// Set when the headless server should ask attached clients to reload
     /// their client-local sound config from disk.
-    pub request_client_sound_config_reload: bool,
+    pub request_client_config_reload: bool,
     /// Set when UI interaction requested a clipboard write that must be
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub rename_pane_target: Option<PaneId>,
+    pub worktree_create: Option<WorktreeCreateState>,
+    pub worktree_open: Option<WorktreeOpenState>,
+    pub worktree_remove: Option<WorktreeRemoveState>,
+    pub worktree_directory: std::path::PathBuf,
+    pub collapsed_space_keys: std::collections::HashSet<String>,
     pub request_complete_onboarding: bool,
     pub name_input: String,
     pub name_input_replace_on_type: bool,
     pub release_notes: Option<ReleaseNotesState>,
     pub product_announcement: Option<ProductAnnouncementState>,
     pub keybind_help: KeybindHelpState,
+    pub navigator: NavigatorState,
+    pub copy_mode: Option<CopyModeState>,
     pub workspace_scroll: usize,
     pub agent_panel_scroll: usize,
     pub tab_scroll: usize,
@@ -942,6 +1217,7 @@ pub struct AppState {
     pub update_dismissed: bool,
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
+    pub copy_feedback: Option<CopyFeedback>,
     /// Last reported focus state for the outer terminal hosting herdr.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
     pub outer_terminal_focus: Option<bool>,
@@ -952,6 +1228,7 @@ pub struct AppState {
     pub sidebar_width: u16,
     pub sidebar_min_width: u16,
     pub sidebar_max_width: u16,
+    pub mobile_width_threshold: u16,
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
@@ -961,11 +1238,25 @@ pub struct AppState {
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
     pub mouse_capture: bool,
+    pub redraw_on_focus_gained: bool,
+    pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
     pub prompt_new_tab_name: bool,
     pub show_agent_labels_on_pane_borders: bool,
+    pub pane_history_persistence: bool,
+    /// Expose the focused pane's cursor anchor to the outer terminal even when
+    /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
+    pub reveal_hidden_cursor_for_cjk_ime: bool,
+    /// Restrict cursor reveal to focused panes whose detected agent matches
+    /// one of these. When false, apply to any focused pane.
+    pub cjk_ime_agent_filter_configured: bool,
+    pub cjk_ime_agents: Vec<crate::detect::Agent>,
+    /// DECSCUSR shape parameter (1–6) for the IME anchor cursor.
+    pub cjk_ime_cursor_shape: u8,
     pub kitty_graphics_enabled: bool,
     pub default_shell: String,
+    pub shell_mode: crate::config::ShellModeConfig,
+    pub new_terminal_cwd: NewTerminalCwdConfig,
     pub pane_scrollback_limit_bytes: usize,
     #[allow(dead_code)] // kept for backward compat; palette.accent is the source of truth
     pub accent: Color,
@@ -991,11 +1282,18 @@ pub struct AppState {
     pub host_terminal_theme: TerminalTheme,
     /// Set when a persisted session snapshot would change.
     pub session_dirty: bool,
+    /// Terminal runtimes that should be shut down by the app/runtime layer
+    /// after state has detached their terminal metadata.
+    pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
 }
 
 impl AppState {
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+    }
+
+    pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
+        self.pane_id_aliases.remove(&pane_id.raw());
     }
 
     pub fn sound_enabled(&self) -> bool {
@@ -1010,21 +1308,50 @@ impl AppState {
         self.show_agent_labels_on_pane_borders
     }
 
-    pub fn focused_pane_requests_mouse_capture(&self) -> bool {
+    pub fn pane_history_persistence_enabled(&self) -> bool {
+        self.pane_history_persistence
+    }
+
+    pub(crate) fn integration_updates_available(&self) -> bool {
+        self.integration_recommendations
+            .iter()
+            .any(|item| item.state == crate::integration::IntegrationStatusKind::Outdated)
+    }
+
+    pub(crate) fn global_menu_attention_badge_visible(&self) -> bool {
+        self.update_available.is_some() || self.integration_updates_available()
+    }
+
+    pub(crate) fn global_menu_item_has_badge(&self, item: &str) -> bool {
+        (item == "update ready" && self.update_available.is_some())
+            || (item == "settings" && self.integration_updates_available())
+    }
+
+    pub(crate) fn settings_section_has_badge(&self, section: SettingsSection) -> bool {
+        section == SettingsSection::Integrations && self.integration_updates_available()
+    }
+
+    pub(crate) fn focused_pane_requests_mouse_capture_from(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ) -> bool {
         self.mode == Mode::Terminal
             && self
                 .active
-                .and_then(|idx| self.focused_runtime_in_workspace(idx))
+                .and_then(|idx| self.focused_runtime_in_workspace(terminal_runtimes, idx))
                 .and_then(crate::terminal::TerminalRuntime::input_state)
                 .is_some_and(crate::pane::InputState::mouse_reporting_enabled)
     }
 
-    pub fn should_capture_host_mouse(&self) -> bool {
-        self.mouse_capture || self.focused_pane_requests_mouse_capture()
+    pub(crate) fn should_capture_host_mouse_from(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ) -> bool {
+        self.mouse_capture || self.focused_pane_requests_mouse_capture_from(terminal_runtimes)
     }
 
-    pub fn is_prefix(&self, key: &crossterm::event::KeyEvent) -> bool {
-        key_matches(key, self.prefix_code, self.prefix_mods)
+    pub fn is_prefix_key(&self, key: crate::input::TerminalKey) -> bool {
+        crate::config::terminal_key_matches_combo(key, (self.prefix_code, self.prefix_mods))
     }
 
     pub fn estimate_pane_size(&self) -> (u16, u16) {
@@ -1037,11 +1364,12 @@ impl AppState {
 
     /// Returns true when the given (workspace, tab, pane) refers to the
     /// currently focused pane in the active workspace's active tab.
-    pub(crate) fn runtime_for_pane_in_workspace(
-        &self,
+    pub(crate) fn runtime_for_pane_in_workspace<'a>(
+        &'a self,
+        terminal_runtimes: &'a crate::terminal::TerminalRuntimeRegistry,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
-    ) -> Option<&crate::terminal::TerminalRuntime> {
+    ) -> Option<&'a crate::terminal::TerminalRuntime> {
         #[cfg(test)]
         if let Some(runtime) = self.workspaces.get(ws_idx)?.test_runtimes.get(&pane_id) {
             return Some(runtime);
@@ -1057,14 +1385,15 @@ impl AppState {
             return Some(runtime);
         }
         let terminal_id = self.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
-        self.terminal_runtimes.get(terminal_id)
+        terminal_runtimes.get(terminal_id)
     }
 
     #[cfg(test)]
-    pub(crate) fn runtime_for_pane(
-        &self,
+    pub(crate) fn runtime_for_pane<'a>(
+        &'a self,
+        terminal_runtimes: &'a crate::terminal::TerminalRuntimeRegistry,
         pane_id: crate::layout::PaneId,
-    ) -> Option<&crate::terminal::TerminalRuntime> {
+    ) -> Option<&'a crate::terminal::TerminalRuntime> {
         self.workspaces.iter().find_map(|ws| {
             #[cfg(test)]
             if let Some(runtime) = ws.test_runtimes.get(&pane_id) {
@@ -1075,17 +1404,18 @@ impl AppState {
                 return Some(runtime);
             }
             let terminal_id = ws.terminal_id(pane_id)?;
-            self.terminal_runtimes.get(terminal_id)
+            terminal_runtimes.get(terminal_id)
         })
     }
 
-    pub(crate) fn focused_runtime_in_workspace(
-        &self,
+    pub(crate) fn focused_runtime_in_workspace<'a>(
+        &'a self,
+        terminal_runtimes: &'a crate::terminal::TerminalRuntimeRegistry,
         ws_idx: usize,
-    ) -> Option<&crate::terminal::TerminalRuntime> {
+    ) -> Option<&'a crate::terminal::TerminalRuntime> {
         let ws = self.workspaces.get(ws_idx)?;
         let pane_id = ws.focused_pane_id()?;
-        self.runtime_for_pane_in_workspace(ws_idx, pane_id)
+        self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
     }
 
     pub fn is_active_pane(
@@ -1110,23 +1440,16 @@ impl AppState {
     }
 }
 
+#[cfg(test)]
 pub fn key_matches(
     key: &crossterm::event::KeyEvent,
     expected_code: KeyCode,
     expected_mods: KeyModifiers,
 ) -> bool {
-    if key.modifiers != expected_mods {
-        return false;
-    }
-
-    match (key.code, expected_code) {
-        (KeyCode::Char(actual), KeyCode::Char(expected))
-            if actual.is_ascii_alphabetic() && expected.is_ascii_alphabetic() =>
-        {
-            actual.eq_ignore_ascii_case(&expected)
-        }
-        (actual, expected) => actual == expected,
-    }
+    crate::config::terminal_key_matches_combo(
+        crate::input::TerminalKey::from(*key),
+        (expected_code, expected_mods),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,29 +1462,44 @@ impl AppState {
     pub fn test_new() -> Self {
         Self {
             terminals: std::collections::HashMap::new(),
-            terminal_runtimes: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
+            pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
             active: None,
+            previous_pane_focus: None,
             selected: 0,
             mode: Mode::Navigate,
             should_quit: false,
-            quit_detaches: false,
+            detach_exits: false,
             detach_requested: false,
             request_new_workspace: false,
             request_new_tab: false,
+            request_new_linked_worktree: None,
+            request_open_existing_worktree: None,
+            request_new_workspace_cwd: None,
+            request_remove_linked_worktree: None,
+            request_submit_worktree_create: false,
+            request_submit_worktree_open: false,
+            request_submit_worktree_remove: false,
             request_reload_config: false,
-            request_client_sound_config_reload: false,
+            request_client_config_reload: false,
             request_clipboard_write: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,
+            worktree_create: None,
+            worktree_open: None,
+            worktree_remove: None,
+            worktree_directory: std::path::PathBuf::from("/tmp/herdr-worktrees"),
+            collapsed_space_keys: std::collections::HashSet::new(),
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
             release_notes: None,
             product_announcement: None,
             keybind_help: KeybindHelpState { scroll: 0 },
+            navigator: NavigatorState::default(),
+            copy_mode: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,
             tab_scroll: 0,
@@ -1195,6 +1533,7 @@ impl AppState {
             update_dismissed: false,
             config_diagnostic: None,
             toast: None,
+            copy_feedback: None,
             outer_terminal_focus: None,
             prefix_code: KeyCode::Char('b'),
             prefix_mods: KeyModifiers::CONTROL,
@@ -1202,17 +1541,27 @@ impl AppState {
             sidebar_width: 26,
             sidebar_min_width: 18,
             sidebar_max_width: 36,
+            mobile_width_threshold: crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             sidebar_section_split: 0.5,
             agent_panel_scope: AgentPanelScope::AllWorkspaces,
             mouse_capture: true,
+            redraw_on_focus_gained: true,
+            mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
             prompt_new_tab_name: true,
             show_agent_labels_on_pane_borders: false,
+            pane_history_persistence: false,
+            reveal_hidden_cursor_for_cjk_ime: false,
+            cjk_ime_agent_filter_configured: false,
+            cjk_ime_agents: Vec::new(),
+            cjk_ime_cursor_shape: 2, // steady_block
             kitty_graphics_enabled: false,
             default_shell: String::new(),
+            shell_mode: crate::config::ShellModeConfig::Auto,
+            new_terminal_cwd: NewTerminalCwdConfig::Follow,
             pane_scrollback_limit_bytes: crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES,
             accent: Color::Cyan,
             sound: SoundConfig {
@@ -1221,69 +1570,7 @@ impl AppState {
             },
             local_sound_playback: false,
             toast_config: ToastConfig::default(),
-            keybinds: Keybinds {
-                new_workspace: (KeyCode::Char('n'), KeyModifiers::empty()),
-                new_workspace_label: "n".into(),
-                rename_workspace: (KeyCode::Char('n'), KeyModifiers::SHIFT),
-                rename_workspace_label: "shift+n".into(),
-                close_workspace: (KeyCode::Char('d'), KeyModifiers::SHIFT),
-                close_workspace_label: "shift+d".into(),
-                detach: None,
-                detach_label: None,
-                reload_config: None,
-                reload_config_label: None,
-                open_notification_target: None,
-                open_notification_target_label: None,
-                previous_workspace: None,
-                previous_workspace_label: None,
-                next_workspace: None,
-                next_workspace_label: None,
-                previous_agent: None,
-                previous_agent_label: None,
-                next_agent: None,
-                next_agent_label: None,
-                indexed_tabs: None,
-                indexed_tabs_label: None,
-                indexed_workspaces: None,
-                indexed_workspaces_label: None,
-                indexed_agents: None,
-                indexed_agents_label: None,
-                new_tab: (KeyCode::Char('c'), KeyModifiers::empty()),
-                new_tab_label: "c".into(),
-                rename_tab: None,
-                rename_tab_label: None,
-                previous_tab: None,
-                previous_tab_label: None,
-                next_tab: None,
-                next_tab_label: None,
-                close_tab: None,
-                close_tab_label: None,
-                rename_pane: None,
-                rename_pane_label: None,
-                edit_scrollback: None,
-                edit_scrollback_label: None,
-                focus_pane_left: None,
-                focus_pane_left_label: None,
-                focus_pane_down: None,
-                focus_pane_down_label: None,
-                focus_pane_up: None,
-                focus_pane_up_label: None,
-                focus_pane_right: None,
-                focus_pane_right_label: None,
-                split_vertical: (KeyCode::Char('v'), KeyModifiers::empty()),
-                split_vertical_label: "v".into(),
-                split_horizontal: (KeyCode::Char('-'), KeyModifiers::empty()),
-                split_horizontal_label: "-".into(),
-                close_pane: (KeyCode::Char('x'), KeyModifiers::empty()),
-                close_pane_label: "x".into(),
-                zoom: (KeyCode::Char('f'), KeyModifiers::empty()),
-                zoom_label: "f".into(),
-                resize_mode: (KeyCode::Char('r'), KeyModifiers::empty()),
-                resize_mode_label: "r".into(),
-                toggle_sidebar: (KeyCode::Char('b'), KeyModifiers::empty()),
-                toggle_sidebar_label: "b".into(),
-                custom_commands: Vec::new(),
-            },
+            keybinds: Keybinds::default(),
             spinner_tick: 0,
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
@@ -1298,6 +1585,7 @@ impl AppState {
             global_menu: MenuListState::new(0),
             host_terminal_theme: TerminalTheme::default(),
             session_dirty: false,
+            terminal_runtime_shutdowns: Vec::new(),
         }
     }
 
@@ -1325,14 +1613,13 @@ impl AppState {
         pane_id: crate::layout::PaneId,
         runtime: crate::terminal::TerminalRuntime,
     ) {
-        let Some(terminal_id) = self
+        if let Some(ws) = self
             .workspaces
-            .iter()
-            .find_map(|ws| ws.terminal_id(pane_id).cloned())
-        else {
-            return;
-        };
-        self.terminal_runtimes.insert(terminal_id, runtime);
+            .iter_mut()
+            .find(|ws| ws.terminal_id(pane_id).is_some())
+        {
+            ws.insert_test_runtime(pane_id, runtime);
+        }
     }
 }
 
@@ -1386,5 +1673,71 @@ mod tests {
             KeyCode::Char('b'),
             KeyModifiers::SHIFT,
         ));
+    }
+
+    #[test]
+    fn linked_worktree_context_menu_keeps_safe_close_and_explicit_remove() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::GitWorkspace {
+                ws_idx: 0,
+                is_linked_worktree: true,
+                has_worktree_children: false,
+                collapsed: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        assert_eq!(
+            menu.items(),
+            &["Rename", "Close", "Delete worktree checkout..."]
+        );
+    }
+
+    #[test]
+    fn git_workspace_context_menu_keeps_remove_for_managed_worktrees_only() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::GitWorkspace {
+                ws_idx: 0,
+                is_linked_worktree: false,
+                has_worktree_children: false,
+                collapsed: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        assert_eq!(
+            menu.items(),
+            &["Rename", "Close", "New worktree", "Open worktree..."]
+        );
+    }
+
+    #[test]
+    fn parent_worktree_context_menu_uses_repo_actions() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::GitWorkspace {
+                ws_idx: 0,
+                is_linked_worktree: false,
+                has_worktree_children: true,
+                collapsed: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        assert_eq!(
+            menu.items(),
+            &[
+                "Rename",
+                "Close group",
+                "New worktree",
+                "Open worktree...",
+                "Collapse"
+            ]
+        );
     }
 }

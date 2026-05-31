@@ -1,7 +1,8 @@
 //! Input handling — translates crossterm key/mouse events into state mutations.
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
+use crate::app::PaneClickState;
 use crate::input::TerminalKey;
 use ratatui::layout::Direction;
 
@@ -22,6 +23,7 @@ enum WheelRouting {
 const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
 const TAB_DRAG_THRESHOLD: u16 = 1;
 
+mod copy_mode;
 mod modal;
 mod mouse;
 mod navigate;
@@ -34,7 +36,7 @@ mod terminal;
 pub(crate) use self::{
     modal::{
         handle_confirm_close_key, handle_context_menu_key, handle_global_menu_key,
-        handle_keybind_help_key, handle_rename_key, handle_resize_key,
+        handle_keybind_help_key, handle_navigator_key, handle_rename_key, handle_resize_key,
     },
     navigate::terminal_direct_navigation_action,
     settings::open_settings_at,
@@ -56,23 +58,35 @@ impl App {
     pub(super) async fn handle_key(&mut self, key: TerminalKey) {
         match self.state.mode {
             Mode::Terminal => self.handle_terminal_key(key).await,
+            Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
+            Mode::Copy => self.handle_copy_mode_key(key),
             _ => {
-                let key = key.as_key_event();
+                let key_event = key.as_key_event();
                 match self.state.mode {
-                    Mode::Onboarding => self.handle_onboarding_key(key),
-                    Mode::ReleaseNotes => self.handle_release_notes_key(key),
-                    Mode::ProductAnnouncement => self.handle_product_announcement_key(key),
-                    Mode::Navigate => unreachable!(),
+                    Mode::Onboarding => self.handle_onboarding_key(key_event),
+                    Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
+                    Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
+                    Mode::Prefix | Mode::Navigate | Mode::Copy => unreachable!(),
                     Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
-                        handle_rename_key(&mut self.state, key)
+                        handle_rename_key(&mut self.state, key_event)
                     }
+                    Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
+                    Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
+                    Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                     Mode::Resize => handle_resize_key(&mut self.state, key),
-                    Mode::ConfirmClose => handle_confirm_close_key(&mut self.state, key),
-                    Mode::ContextMenu => handle_context_menu_key(&mut self.state, key),
-                    Mode::Settings => self.handle_settings_key(key),
-                    Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key),
-                    Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key),
+                    Mode::ConfirmClose => handle_confirm_close_key(&mut self.state, key_event),
+                    Mode::ContextMenu => {
+                        handle_context_menu_key(
+                            &mut self.state,
+                            &mut self.terminal_runtimes,
+                            key_event,
+                        );
+                    }
+                    Mode::Settings => self.handle_settings_key(key_event),
+                    Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
+                    Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
+                    Mode::Navigator => handle_navigator_key(&mut self.state, key_event),
                     Mode::Terminal => unreachable!(),
                 }
             }
@@ -84,7 +98,10 @@ impl App {
             return;
         }
         if let Some(ws_idx) = self.state.active {
-            if let Some(rt) = self.state.focused_runtime_in_workspace(ws_idx) {
+            if let Some(rt) = self
+                .state
+                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+            {
                 let _ = rt.send_paste(text).await;
             }
         }
@@ -180,18 +197,31 @@ impl App {
             }
         }
 
+        if self.handle_modified_url_click(mouse) {
+            return;
+        }
+
+        let handled_pane_double_click = self.handle_pane_double_click(mouse);
+
         let previous_agent_panel_scope = self.state.agent_panel_scope;
         let previous_settings_section = self.state.settings.section;
-        if let Some(action) = self.state.handle_mouse(mouse) {
-            match action {
-                SettingsAction::SaveTheme(name) => self.save_theme(&name),
-                SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
-                SettingsAction::SaveToastDelivery(delivery) => self.save_toast_delivery(delivery),
-                SettingsAction::SaveAgentBorderLabels(enabled) => {
-                    self.save_agent_border_labels(enabled)
-                }
-                SettingsAction::InstallRecommendedIntegrations => {
-                    self.install_recommended_integrations()
+        if !handled_pane_double_click {
+            if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
+                match action {
+                    SettingsAction::SaveTheme(name) => self.save_theme(&name),
+                    SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
+                    SettingsAction::SaveToastDelivery(delivery) => {
+                        self.save_toast_delivery(delivery)
+                    }
+                    SettingsAction::SaveAgentBorderLabels(enabled) => {
+                        self.save_agent_border_labels(enabled)
+                    }
+                    SettingsAction::SavePaneHistory(enabled) => {
+                        self.save_pane_history_persistence(enabled)
+                    }
+                    SettingsAction::InstallRecommendedIntegrations => {
+                        self.install_recommended_integrations()
+                    }
                 }
             }
         }
@@ -223,6 +253,126 @@ impl App {
                 Some(std::time::Instant::now() + super::SELECTION_AUTOSCROLL_INTERVAL);
         }
     }
+
+    fn handle_modified_url_click(&mut self, mouse: MouseEvent) -> bool {
+        if self.state.mode != Mode::Terminal
+            || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !mouse.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return false;
+        }
+
+        let Some(info) = self.state.pane_at(mouse.column, mouse.row).cloned() else {
+            return false;
+        };
+        let viewport_row = mouse.row.saturating_sub(info.inner_rect.y);
+        let col = mouse.column.saturating_sub(info.inner_rect.x);
+        let Some(url) =
+            self.state
+                .url_at_pane_cell(&self.terminal_runtimes, info.id, viewport_row, col)
+        else {
+            return false;
+        };
+
+        self.last_pane_click = None;
+        if let Err(err) = crate::platform::open_url(&url) {
+            tracing::warn!(err = %err, url = %url, "failed to open pane URL");
+        }
+        true
+    }
+
+    fn handle_pane_double_click(&mut self, mouse: MouseEvent) -> bool {
+        // A pane press stops being a double-click candidate once it becomes
+        // a drag or completes as a real text selection.
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.last_pane_click = None;
+                return false;
+            }
+            MouseEventKind::Up(MouseButton::Left)
+                if self
+                    .state
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.is_visible()) =>
+            {
+                self.last_pane_click = None;
+                return false;
+            }
+            _ => {}
+        }
+
+        // Only terminal-pane left-clicks can start this gesture; other clicks
+        // should keep their existing mouse behavior and clear stale candidates.
+        let Some(click) = self.pane_click_candidate(mouse) else {
+            return false;
+        };
+
+        // Require the second click to land near the first click in the same pane
+        // and within the double-click window so adjacent interactions do not copy.
+        if !self.take_pane_double_click(click) {
+            return false;
+        }
+
+        // Preserve a short highlight after copying so the user gets visible
+        // confirmation without leaving a persistent selection behind.
+        self.copy_double_clicked_word(click)
+    }
+
+    fn pane_click_candidate(&mut self, mouse: MouseEvent) -> Option<PaneClickState> {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return None;
+        }
+
+        if !mouse.modifiers.is_empty() {
+            self.last_pane_click = None;
+            return None;
+        }
+
+        if self.state.mode != Mode::Terminal {
+            self.last_pane_click = None;
+            return None;
+        }
+
+        let Some(info) = self.state.pane_at(mouse.column, mouse.row).cloned() else {
+            self.last_pane_click = None;
+            return None;
+        };
+
+        Some(PaneClickState {
+            pane_id: info.id,
+            viewport_row: mouse.row - info.inner_rect.y,
+            col: mouse.column - info.inner_rect.x,
+            at: std::time::Instant::now(),
+        })
+    }
+
+    fn take_pane_double_click(&mut self, click: PaneClickState) -> bool {
+        if !self
+            .last_pane_click
+            .is_some_and(|last| last.is_double_click_for(click))
+        {
+            self.last_pane_click = Some(click);
+            return false;
+        }
+
+        self.last_pane_click = None;
+        true
+    }
+
+    fn copy_double_clicked_word(&mut self, click: PaneClickState) -> bool {
+        let copied = self.state.copy_word_at_pane_cell(
+            &self.terminal_runtimes,
+            click.pane_id,
+            click.viewport_row,
+            click.col,
+        );
+        if copied {
+            self.selection_highlight_clear_deadline =
+                Some(std::time::Instant::now() + super::PANE_COPY_HIGHLIGHT_DURATION);
+        }
+        copied
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +381,11 @@ impl App {
 
 // Note: split_pane needs runtime (event_tx for PTY spawn), so it lives on App
 impl AppState {
-    pub(crate) fn split_pane(&mut self, direction: Direction) {
+    pub(crate) fn split_pane(
+        &mut self,
+        terminal_runtimes: &mut crate::terminal::TerminalRuntimeRegistry,
+        direction: Direction,
+    ) {
         // Actual PTY spawning happens in Workspace::split_focused
         // which needs events channel — this is called from navigate_key
         // where we don't have async context, so the workspace handles it
@@ -239,19 +393,23 @@ impl AppState {
         let new_rows = (rows / 2).max(4);
         let new_cols = (cols / 2).max(10);
 
-        let cwd = self
+        let follow_cwd = self
             .active
             .and_then(|i| self.workspaces.get(i))
             .and_then(|ws| {
                 let tab = ws.active_tab()?;
-                tab.cwd_for_pane(
-                    tab.layout.focused(),
-                    &self.terminals,
-                    &self.terminal_runtimes,
-                )
+                tab.cwd_for_pane(tab.layout.focused(), &self.terminals, terminal_runtimes)
             });
+        let cwd = Some(super::creation::resolve_new_terminal_cwd(
+            &self.new_terminal_cwd,
+            follow_cwd,
+        ));
 
-        if let Some(ws) = self.active.and_then(|i| self.workspaces.get_mut(i)) {
+        let previous_focus = self.current_pane_focus_target();
+        if let Some(ws_idx) = self.active {
+            let Some(ws) = self.workspaces.get_mut(ws_idx) else {
+                return;
+            };
             if let Ok(new_pane) = ws.split_focused(
                 direction,
                 new_rows,
@@ -259,14 +417,14 @@ impl AppState {
                 cwd,
                 self.pane_scrollback_limit_bytes,
                 self.host_terminal_theme,
-                &self.default_shell,
+                crate::pane::PaneShellConfig::new(&self.default_shell, self.shell_mode),
             ) {
                 let new_id = new_pane.pane_id;
-                self.terminal_runtimes
-                    .insert(new_pane.terminal.id.clone(), new_pane.runtime);
+                terminal_runtimes.insert(new_pane.terminal.id.clone(), new_pane.runtime);
+                self.remove_alias_shadowed_by_new_pane(new_id);
                 self.terminals
                     .insert(new_pane.terminal.id.clone(), new_pane.terminal);
-                ws.layout.focus_pane(new_id);
+                self.record_pane_focus_change(previous_focus, ws_idx, new_id);
                 self.mark_session_dirty();
                 self.mode = Mode::Terminal;
             }
@@ -331,15 +489,17 @@ fn numbered_lines_bytes(count: usize) -> Vec<u8> {
 
 #[cfg(test)]
 fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
+    let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     crate::persist::capture(
         &state.workspaces,
         &state.terminals,
-        &state.terminal_runtimes,
+        &terminal_runtimes,
         state.active,
         state.selected,
         state.agent_panel_scope,
         state.sidebar_width,
         state.sidebar_section_split,
+        state.collapsed_space_keys.clone(),
     )
 }
 

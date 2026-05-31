@@ -1,13 +1,12 @@
 mod id;
+mod runtime;
+mod runtime_registry;
 pub mod state;
 
 pub use id::TerminalId;
-pub(crate) use state::stabilize_agent_state;
-pub use state::{EffectiveStateChange, TerminalState};
-
-/// Live runtime for a server-owned terminal.
-///
-/// The implementation still lives in the pane module during this migration, but
-/// all new ownership should address it by `TerminalId` through this terminal
-/// noun.
-pub type TerminalRuntime = crate::pane::PaneRuntime;
+pub use runtime::TerminalRuntime;
+pub(crate) use runtime_registry::TerminalRuntimeRegistry;
+pub use state::{
+    AgentMetadataReport, EffectivePresentation, EffectiveStateChange, TerminalState,
+    TerminalStateMutation,
+};

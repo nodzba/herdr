@@ -13,9 +13,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::server::protocol::{
-    self, ClientMessage, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
-    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+use crate::protocol::{
+    self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
+    ClientMessage, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE,
+    MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
 /// Minimum accepted attached client size.
@@ -55,6 +56,8 @@ pub(crate) enum ServerEvent {
         cell_width_px: u32,
         cell_height_px: u32,
         render_encoding: RenderEncoding,
+        keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
+        direct_attach_requested: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -70,6 +73,16 @@ pub(crate) enum ServerEvent {
         client_id: u64,
         terminal_id: String,
         takeover: bool,
+    },
+    /// A direct terminal attach client requested scrollback movement.
+    ClientAttachScroll {
+        client_id: u64,
+        source: AttachScrollSource,
+        direction: AttachScrollDirection,
+        lines: u16,
+        column: Option<u16>,
+        row: Option<u16>,
+        modifiers: u8,
     },
     /// A client sent a resize message.
     ClientResize {
@@ -94,6 +107,23 @@ pub(crate) fn clamp_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
     let clamped_cols = cols.max(MIN_CLIENT_COLS);
     let clamped_rows = rows.max(MIN_CLIENT_ROWS);
     (clamped_cols, clamped_rows)
+}
+
+fn parse_client_keybindings(
+    keybindings: ClientKeybindings,
+) -> Result<Option<Box<crate::config::LiveKeybindConfig>>, String> {
+    match keybindings {
+        ClientKeybindings::Server => Ok(None),
+        ClientKeybindings::Local { keys_toml } => {
+            let mut config = toml::from_str::<crate::config::Config>(&keys_toml)
+                .map_err(|err| format!("invalid client keybindings: {err}"))?;
+            config.keys.command.clear();
+            Ok(Some(Box::new(crate::config::LiveKeybindConfig {
+                prefix: config.prefix_key(),
+                keybinds: config.keybinds(),
+            })))
+        }
+    }
 }
 
 /// Handles the client handshake on a blocking thread.
@@ -130,7 +160,15 @@ pub(crate) fn handle_client_handshake(
         }
     };
 
-    let (client_cols, client_rows, cell_width_px, cell_height_px, render_encoding) = match hello {
+    let (
+        client_cols,
+        client_rows,
+        cell_width_px,
+        cell_height_px,
+        render_encoding,
+        keybindings,
+        direct_attach_requested,
+    ) = match hello {
         ClientMessage::Hello {
             version,
             cols,
@@ -138,6 +176,8 @@ pub(crate) fn handle_client_handshake(
             cell_width_px,
             cell_height_px,
             requested_encoding,
+            keybindings,
+            launch_mode,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -154,6 +194,19 @@ pub(crate) fn handle_client_handshake(
                 }
             }
 
+            let keybindings = match parse_client_keybindings(keybindings) {
+                Ok(keybindings) => keybindings,
+                Err(error) => {
+                    let welcome = ServerMessage::Welcome {
+                        version: PROTOCOL_VERSION,
+                        encoding: RenderEncoding::SemanticFrame,
+                        error: Some(error),
+                    };
+                    let _ = protocol::write_message(&mut stream, &welcome);
+                    return Ok(());
+                }
+            };
+
             // Clamp size.
             let (clamped_cols, clamped_rows) = clamp_terminal_size(cols, rows);
             (
@@ -162,6 +215,8 @@ pub(crate) fn handle_client_handshake(
                 cell_width_px,
                 cell_height_px,
                 requested_encoding,
+                keybindings,
+                launch_mode == ClientLaunchMode::TerminalAttach,
             )
         }
         _ => {
@@ -204,6 +259,8 @@ pub(crate) fn handle_client_handshake(
         cell_width_px,
         cell_height_px,
         render_encoding,
+        keybindings,
+        direct_attach_requested,
         writer,
     });
 
@@ -396,6 +453,22 @@ fn client_read_loop(
                 terminal_id,
                 takeover,
             },
+            ClientMessage::AttachScroll {
+                source,
+                direction,
+                lines,
+                column,
+                row,
+                modifiers,
+            } => ServerEvent::ClientAttachScroll {
+                client_id,
+                source,
+                direction,
+                lines,
+                column,
+                row,
+                modifiers,
+            },
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;
@@ -447,6 +520,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_client_keybindings_accepts_local_profile() {
+        let keybindings = parse_client_keybindings(ClientKeybindings::Local {
+            keys_toml: r#"
+[keys]
+prefix = "ctrl+a"
+new_tab = "prefix+t"
+
+[[keys.command]]
+key = "prefix+g"
+command = "lazygit"
+"#
+            .to_owned(),
+        })
+        .expect("valid client keybindings")
+        .expect("local profile");
+
+        assert_eq!(keybindings.prefix.0, crossterm::event::KeyCode::Char('a'));
+        assert!(keybindings
+            .keybinds
+            .new_tab
+            .bindings
+            .iter()
+            .any(|binding| binding.label == "prefix+t"));
+        assert!(keybindings.keybinds.custom_commands.is_empty());
+    }
+
+    #[test]
+    fn parse_client_keybindings_tolerates_disabled_bindings() {
+        let keybindings = parse_client_keybindings(ClientKeybindings::Local {
+            keys_toml: r#"
+[keys]
+new_tab = "ctrl+notakey"
+"#
+            .to_owned(),
+        })
+        .expect("diagnostic-only client keybindings should be accepted")
+        .expect("local profile");
+
+        assert!(keybindings.keybinds.new_tab.bindings.is_empty());
+        assert!(keybindings
+            .keybinds
+            .next_tab
+            .bindings
+            .iter()
+            .any(|binding| binding.label == "prefix+n"));
+    }
+
+    #[test]
     fn handshake_negotiates_terminal_ansi_encoding() {
         let (mut client_stream, server_stream) = UnixStream::pair().expect("socket pair");
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
@@ -465,6 +586,8 @@ mod tests {
                 cell_width_px: 8,
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::App,
             },
         )
         .expect("write hello");
@@ -495,12 +618,79 @@ mod tests {
                 cell_width_px,
                 cell_height_px,
                 render_encoding,
+                keybindings,
+                direct_attach_requested,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
                 assert_eq!((cols, rows), (100, 30));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
+                assert!(keybindings.is_none());
+                assert!(!direct_attach_requested);
+                drop(writer);
+            }
+            other => panic!("expected ClientConnected, got {other:?}"),
+        }
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("handshake thread join")
+            .expect("handshake thread result");
+    }
+
+    #[test]
+    fn handshake_marks_terminal_attach_launch_mode() {
+        let (mut client_stream, server_stream) = UnixStream::pair().expect("socket pair");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handshake_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols: 100,
+                rows: 30,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::TerminalAttach,
+            },
+        )
+        .expect("write hello");
+
+        let welcome: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
+        match welcome {
+            ServerMessage::Welcome {
+                version,
+                encoding,
+                error,
+            } => {
+                assert_eq!(version, PROTOCOL_VERSION);
+                assert_eq!(encoding, RenderEncoding::TerminalAnsi);
+                assert_eq!(error, None);
+            }
+            other => panic!("expected Welcome, got {other:?}"),
+        }
+
+        match server_event_rx
+            .blocking_recv()
+            .expect("client connected event")
+        {
+            ServerEvent::ClientConnected {
+                direct_attach_requested,
+                writer,
+                ..
+            } => {
+                assert!(direct_attach_requested);
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),

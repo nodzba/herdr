@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use super::headless::client_socket_path;
+use super::socket_paths::client_socket_path;
 
 /// Maximum time to wait for the server's client socket to become ready
 /// after spawning the server process.
@@ -86,24 +86,26 @@ fn read_server_status() -> io::Result<Option<crate::api::RuntimeStatus>> {
 
 fn validate_running_server_compatibility() -> io::Result<()> {
     let Some(status) = read_server_status()? else {
-        return Err(io::Error::other(
-            "a herdr server is listening, but its status API is unavailable. Try `herdr server stop`; if that fails, stop the old server process manually, then run `herdr` again.",
-        ));
+        return Err(io::Error::other(format!(
+            "a herdr server is listening, but its status API is unavailable.\n\n{}\nIf that fails, stop the old server process manually.",
+            crate::session::active_restart_after_update_guidance()
+        )));
     };
 
-    if status.protocol == Some(crate::server::protocol::PROTOCOL_VERSION) {
+    if status.protocol == Some(crate::protocol::PROTOCOL_VERSION) {
         return Ok(());
     }
 
     Err(io::Error::other(format!(
-        "herdr server is running from v{} / protocol {}, but this client is v{} / protocol {}.\nStop the old server with `herdr server stop`, then run `herdr` again.",
+        "Herdr was updated, but this session is still running the old server.\n\nserver: v{} protocol {}\nclient: v{} protocol {}\n\n{}",
         status.version.as_deref().unwrap_or("unknown"),
         status
             .protocol
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         env!("CARGO_PKG_VERSION"),
-        crate::server::protocol::PROTOCOL_VERSION
+        crate::protocol::PROTOCOL_VERSION,
+        crate::session::active_restart_after_update_guidance()
     )))
 }
 
@@ -423,6 +425,55 @@ mod tests {
             "unexpected error: {err}"
         );
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_running_server_compatibility_names_session_commands_for_protocol_mismatch() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = unique_test_dir("named-protocol");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::set_var(crate::session::SESSION_ENV_VAR, "work");
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
+        let path = crate::session::api_socket_path_for(Some("work"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(request.contains("ping"));
+            let body = format!(
+                "{{\"id\":\"autodetect:server:status\",\"result\":{{\"type\":\"pong\",\"version\":\"0.5.5\",\"protocol\":{}}}}}\n",
+                crate::protocol::PROTOCOL_VERSION + 1
+            );
+            stream.write_all(body.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let err = validate_running_server_compatibility().unwrap_err();
+        let message = err.to_string();
+
+        let _ = handle.join();
+        assert!(
+            message.contains("Stop the old server to use the new version"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("Run `herdr session stop work`"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("then run `herdr session attach work` again"),
+            "unexpected error: {message}"
+        );
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
         let _ = std::fs::remove_dir_all(dir);
     }
 }

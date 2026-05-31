@@ -3,9 +3,24 @@
 //! Background tasks (PTY child watchers, future hook listeners, etc.) send
 //! events to the main loop through this channel. No polling needed.
 
+use std::time::Instant;
+
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
-use crate::workspace::WorkspaceGitStatus;
+use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
+
+#[derive(Debug)]
+pub struct WorktreeAddResult {
+    pub path: std::path::PathBuf,
+    pub result: Result<(), String>,
+}
+
+#[derive(Debug)]
+pub struct WorktreeRemoveResult {
+    pub workspace_id: String,
+    pub path: std::path::PathBuf,
+    pub result: Result<(), String>,
+}
 
 /// An event from a background task to the main loop.
 #[derive(Debug)]
@@ -17,6 +32,11 @@ pub enum AppEvent {
         pane_id: PaneId,
         agent: Option<Agent>,
         state: AgentState,
+        visible_blocker: bool,
+        visible_idle: bool,
+        visible_working: bool,
+        process_exited: bool,
+        observed_at: Instant,
     },
     /// Hook-authoritative agent state was reported for a pane.
     HookStateReported {
@@ -27,6 +47,24 @@ pub enum AppEvent {
         message: Option<String>,
         custom_status: Option<String>,
         seq: Option<u64>,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+    },
+    /// Display-only agent metadata was reported for a pane.
+    HookMetadataReported {
+        pane_id: PaneId,
+        source: String,
+        agent_label: Option<String>,
+        applies_to_source: Option<String>,
+        title: Option<String>,
+        display_agent: Option<String>,
+        custom_status: Option<String>,
+        state_labels: std::collections::HashMap<String, String>,
+        clear_title: bool,
+        clear_display_agent: bool,
+        clear_custom_status: bool,
+        clear_state_labels: bool,
+        seq: Option<u64>,
+        ttl: Option<std::time::Duration>,
     },
     /// Hook authority was explicitly cleared for a pane.
     HookAuthorityCleared {
@@ -58,5 +96,12 @@ pub enum AppEvent {
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
     /// Background git status refresh completed for workspaces.
-    GitStatusRefreshed { results: Vec<WorkspaceGitStatus> },
+    GitStatusRefreshed {
+        results: Vec<WorkspaceGitStatus>,
+        cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
+    },
+    /// Background `git worktree add` completed.
+    WorktreeAddFinished(WorktreeAddResult),
+    /// Background `git worktree remove` completed.
+    WorktreeRemoveFinished(WorktreeRemoveResult),
 }
