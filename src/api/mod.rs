@@ -42,6 +42,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneReportMetadata(_)
             | Method::PaneClearAgentAuthority(_)
             | Method::PaneReleaseAgent(_)
+            | Method::PaneSetDroidSession(_)
+            | Method::PaneSetPiSession(_)
             | Method::PaneClose(_)
     )
 }

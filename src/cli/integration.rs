@@ -103,13 +103,13 @@ fn parse_integration_target(
 ) -> std::io::Result<Option<IntegrationTarget>> {
     let Some(target) = args.first().map(|arg| arg.as_str()) else {
         eprintln!(
-            "usage: herdr integration {action} <pi|omp|claude|codex|opencode|hermes|qodercli>"
+            "usage: herdr integration {action} <pi|omp|claude|codex|opencode|hermes|qodercli|droid>"
         );
         return Ok(None);
     };
     if args.len() != 1 {
         eprintln!(
-            "usage: herdr integration {action} <pi|omp|claude|codex|opencode|hermes|qodercli>"
+            "usage: herdr integration {action} <pi|omp|claude|codex|opencode|hermes|qodercli|droid>"
         );
         return Ok(None);
     }
@@ -122,9 +122,12 @@ fn parse_integration_target(
         "opencode" => IntegrationTarget::Opencode,
         "hermes" => IntegrationTarget::Hermes,
         "qodercli" => IntegrationTarget::Qodercli,
+        "droid" => IntegrationTarget::Droid,
         _ => {
             eprintln!("unknown integration target: {target}");
-            eprintln!("currently supported: pi, omp, claude, codex, opencode, hermes, qodercli");
+            eprintln!(
+                "currently supported: pi, omp, claude, codex, opencode, hermes, qodercli, droid"
+            );
             return Ok(None);
         }
     };
