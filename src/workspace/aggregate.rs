@@ -19,6 +19,7 @@ pub struct PaneDetail {
     pub seen: bool,
     pub custom_status: Option<String>,
     pub droid_session_id: Option<String>,
+    pub pi_session_file: Option<String>,
 }
 
 impl Tab {
@@ -53,6 +54,7 @@ impl Tab {
                     seen: pane.seen,
                     custom_status: terminal.effective_custom_status().map(str::to_string),
                     droid_session_id: terminal.droid_session_id.clone(),
+                    pi_session_file: terminal.pi_session_file.clone(),
                 })
             })
             .collect()

@@ -26,6 +26,7 @@ pub(crate) struct AgentPanelEntry {
     pub seen: bool,
     pub custom_status: Option<String>,
     pub droid_session_id: Option<String>,
+    pub pi_session_file: Option<String>,
 }
 
 fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
@@ -131,6 +132,7 @@ pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                     seen: detail.seen,
                     custom_status: detail.custom_status,
                     droid_session_id: detail.droid_session_id,
+                    pi_session_file: detail.pi_session_file,
                 })
                 .collect()
         }
@@ -154,6 +156,7 @@ pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                         seen: detail.seen,
                         custom_status: detail.custom_status,
                         droid_session_id: detail.droid_session_id,
+                        pi_session_file: detail.pi_session_file,
                     })
             })
             .collect(),
@@ -173,6 +176,20 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     }
     let prefix: String = text.chars().take(max_width.saturating_sub(1)).collect();
     format!("{prefix}…")
+}
+
+/// Derive a short, human-readable id from a pi session file path so the agent
+/// panel can show that a resumable session was detected. Pi session files are
+/// named `<timestamp>_<uuid>.jsonl`; prefer the uuid segment, falling back to
+/// the bare file stem.
+fn pi_session_short_id(session_file: &str) -> Option<String> {
+    let stem = std::path::Path::new(session_file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())?;
+    let core = stem.rsplit('_').next().unwrap_or(stem);
+    let core = if core.is_empty() { stem } else { core };
+    let short: String = core.chars().take(8).collect();
+    (!short.is_empty()).then_some(short)
 }
 
 fn format_agent_panel_primary_label(entry: &AgentPanelEntry, max_width: usize) -> String {
@@ -851,6 +868,14 @@ fn render_agent_detail(app: &AppState, frame: &mut Frame, area: Rect) {
             status_spans.push(Span::styled(" ", agent_style));
             status_spans.push(Span::styled(short, agent_style));
         }
+        if let Some(short) = detail
+            .pi_session_file
+            .as_deref()
+            .and_then(pi_session_short_id)
+        {
+            status_spans.push(Span::styled(" ", agent_style));
+            status_spans.push(Span::styled(short, agent_style));
+        }
         if let Some(custom_status) = &detail.custom_status {
             status_spans.push(Span::styled(" · ", agent_style));
             status_spans.push(Span::styled(custom_status.clone(), agent_style));
@@ -907,6 +932,30 @@ fn render_sidebar_toggle(
 mod tests {
     use super::*;
     use crate::{detect::Agent, workspace::Workspace};
+
+    #[test]
+    fn pi_session_short_id_prefers_uuid_segment() {
+        assert_eq!(
+            pi_session_short_id(
+                "/home/can/.pi/agent/sessions/--home-can-herdr--/1717000000000_abcdef1234.jsonl"
+            )
+            .as_deref(),
+            Some("abcdef12")
+        );
+    }
+
+    #[test]
+    fn pi_session_short_id_falls_back_to_stem_without_underscore() {
+        assert_eq!(
+            pi_session_short_id("/tmp/session.jsonl").as_deref(),
+            Some("session")
+        );
+    }
+
+    #[test]
+    fn pi_session_short_id_handles_empty_path() {
+        assert_eq!(pi_session_short_id(""), None);
+    }
 
     #[test]
     fn all_workspaces_agent_panel_entries_use_workspace_and_optional_tab_labels() {
@@ -987,6 +1036,7 @@ mod tests {
             seen: true,
             custom_status: None,
             droid_session_id: None,
+            pi_session_file: None,
         };
 
         let label = format_agent_panel_primary_label(&entry, 18);

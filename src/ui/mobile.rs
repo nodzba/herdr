@@ -920,6 +920,7 @@ mod tests {
             seen: true,
             custom_status: None,
             droid_session_id: None,
+            pi_session_file: None,
         }
     }
 
