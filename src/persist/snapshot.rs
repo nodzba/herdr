@@ -74,6 +74,8 @@ pub struct PaneSnapshot {
     pub agent_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub droid_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_session_file: Option<String>,
 }
 
 /// Serializable BSP tree.
@@ -284,6 +286,11 @@ fn capture_tab(
             .get(id)
             .and_then(|pane| terminals.get(&pane.attached_terminal_id))
             .and_then(|terminal| terminal.droid_session_id.clone());
+        let pi_session_file = tab
+            .panes
+            .get(id)
+            .and_then(|pane| terminals.get(&pane.attached_terminal_id))
+            .and_then(|terminal| terminal.pi_session_file.clone());
         panes.insert(
             id.raw(),
             PaneSnapshot {
@@ -291,6 +298,7 @@ fn capture_tab(
                 label,
                 agent_name,
                 droid_session_id,
+                pi_session_file,
             },
         );
     }
@@ -451,6 +459,7 @@ mod tests {
                 label: None,
                 agent_name: None,
                 droid_session_id: None,
+                pi_session_file: None,
             },
         );
         panes.insert(
@@ -460,6 +469,7 @@ mod tests {
                 label: Some("website".into()),
                 agent_name: None,
                 droid_session_id: None,
+                pi_session_file: None,
             },
         );
 
@@ -516,6 +526,56 @@ mod tests {
         );
         assert_eq!(restored.sidebar_width, Some(26));
         assert_eq!(restored.sidebar_section_split, Some(0.5));
+    }
+
+    #[test]
+    fn round_trip_preserves_pi_session_file() {
+        let mut panes = HashMap::new();
+        panes.insert(
+            0,
+            PaneSnapshot {
+                cwd: PathBuf::from("/home/can/Projects/herdr"),
+                label: None,
+                agent_name: Some("pi".into()),
+                droid_session_id: None,
+                pi_session_file: Some(
+                    "/home/can/.pi/agent/sessions/--home-can-Projects-herdr--/123_abc.jsonl".into(),
+                ),
+            },
+        );
+
+        let snap = SessionSnapshot {
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("wproj".to_string()),
+                custom_name: None,
+                identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes,
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            agent_panel_scope: AgentPanelScope::CurrentWorkspace,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            version: SNAPSHOT_VERSION,
+        };
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert_eq!(
+            restored.workspaces[0].tabs[0].panes[&0]
+                .pi_session_file
+                .as_deref(),
+            Some("/home/can/.pi/agent/sessions/--home-can-Projects-herdr--/123_abc.jsonl")
+        );
     }
 
     #[test]
@@ -775,6 +835,7 @@ mod tests {
                 label: None,
                 agent_name: None,
                 droid_session_id: None,
+                pi_session_file: None,
             },
         );
         panes.insert(
@@ -786,6 +847,7 @@ mod tests {
                 label: None,
                 agent_name: None,
                 droid_session_id: None,
+                pi_session_file: None,
             },
         );
 

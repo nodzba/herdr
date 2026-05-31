@@ -40,6 +40,7 @@ pub struct TerminalState {
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
     pub droid_session_id: Option<String>,
+    pub pi_session_file: Option<String>,
     hook_report_sequences: HashMap<String, u64>,
     pub state: AgentState,
     pub revision: u64,
@@ -57,6 +58,7 @@ impl TerminalState {
             manual_label: None,
             agent_name: None,
             droid_session_id: None,
+            pi_session_file: None,
             hook_report_sequences: HashMap::new(),
             state: AgentState::Unknown,
             revision: 0,
@@ -276,6 +278,15 @@ impl TerminalState {
         self.droid_session_id = None;
     }
 
+    pub fn set_pi_session_file(&mut self, session_file: String) {
+        let path = session_file.trim().to_string();
+        self.pi_session_file = (!path.is_empty()).then_some(path);
+    }
+
+    pub fn clear_pi_session_file(&mut self) {
+        self.pi_session_file = None;
+    }
+
     pub fn is_agent_terminal(&self) -> bool {
         self.agent_name.is_some()
             || self.effective_agent_label().is_some()
@@ -359,6 +370,26 @@ mod tests {
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    #[test]
+    fn pi_session_file_set_trims_and_clears() {
+        let mut terminal = test_terminal();
+        assert_eq!(terminal.pi_session_file, None);
+
+        terminal.set_pi_session_file("  /home/can/.pi/agent/sessions/x.jsonl  ".to_string());
+        assert_eq!(
+            terminal.pi_session_file.as_deref(),
+            Some("/home/can/.pi/agent/sessions/x.jsonl")
+        );
+
+        // Whitespace-only input is treated as no session.
+        terminal.set_pi_session_file("   ".to_string());
+        assert_eq!(terminal.pi_session_file, None);
+
+        terminal.set_pi_session_file("/tmp/s.jsonl".to_string());
+        terminal.clear_pi_session_file();
+        assert_eq!(terminal.pi_session_file, None);
     }
 
     #[test]

@@ -182,6 +182,25 @@ fn restore_tab(
             .get(id)
             .and_then(|old_id| snap.panes.get(old_id))
             .and_then(|p| p.droid_session_id.clone());
+        let saved_pi_session_file = reverse_id_map
+            .get(id)
+            .and_then(|old_id| snap.panes.get(old_id))
+            .and_then(|p| p.pi_session_file.clone());
+
+        let spawn_shell = || {
+            TerminalRuntime::spawn(
+                *id,
+                rows,
+                cols,
+                cwd.clone(),
+                scrollback_limit_bytes,
+                crate::terminal_theme::TerminalTheme::default(),
+                default_shell,
+                events.clone(),
+                render_notify.clone(),
+                render_dirty.clone(),
+            )
+        };
 
         let runtime_result = if let Some(ref session_id) = saved_droid_session_id {
             let session_file = droid_session_jsonl_path(&cwd, session_id);
@@ -208,32 +227,36 @@ fn restore_tab(
                     session_id = %session_id,
                     "droid session file not found, spawning fresh shell"
                 );
-                TerminalRuntime::spawn(
+                spawn_shell()
+            }
+        } else if let Some(ref session_file) = saved_pi_session_file {
+            if std::path::Path::new(session_file).is_file() {
+                let argv = vec![
+                    "pi".to_string(),
+                    "--session".to_string(),
+                    session_file.clone(),
+                ];
+                TerminalRuntime::spawn_argv_command(
                     *id,
                     rows,
                     cols,
                     cwd.clone(),
+                    &argv,
                     scrollback_limit_bytes,
                     crate::terminal_theme::TerminalTheme::default(),
-                    default_shell,
                     events.clone(),
                     render_notify.clone(),
                     render_dirty.clone(),
                 )
+            } else {
+                tracing::warn!(
+                    session_file = %session_file,
+                    "pi session file not found, spawning fresh shell"
+                );
+                spawn_shell()
             }
         } else {
-            TerminalRuntime::spawn(
-                *id,
-                rows,
-                cols,
-                cwd.clone(),
-                scrollback_limit_bytes,
-                crate::terminal_theme::TerminalTheme::default(),
-                default_shell,
-                events.clone(),
-                render_notify.clone(),
-                render_dirty.clone(),
-            )
+            spawn_shell()
         };
 
         match runtime_result {
@@ -248,6 +271,9 @@ fn restore_tab(
                 }
                 if let Some(session_id) = saved_droid_session_id {
                     terminal.set_droid_session_id(session_id);
+                }
+                if let Some(session_file) = saved_pi_session_file {
+                    terminal.set_pi_session_file(session_file);
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);

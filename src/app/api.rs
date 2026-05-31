@@ -1362,6 +1362,26 @@ impl App {
                     result: ResponseResult::Ok {},
                 }
             }
+            Method::PaneSetPiSession(params) => {
+                let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+                    return serde_json::to_string(&ErrorResponse {
+                        id: request.id,
+                        error: ErrorBody {
+                            code: "pane_not_found".into(),
+                            message: format!("pane {} not found", params.pane_id),
+                        },
+                    })
+                    .unwrap();
+                };
+                self.handle_internal_event(crate::events::AppEvent::PiSessionUpdate {
+                    pane_id,
+                    session_file: params.session_file,
+                });
+                SuccessResponse {
+                    id: request.id,
+                    result: ResponseResult::Ok {},
+                }
+            }
             Method::PaneSendText(params) => {
                 let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
                     return serde_json::to_string(&ErrorResponse {

@@ -78,6 +78,8 @@ pub enum Method {
     PaneReleaseAgent(PaneReleaseAgentParams),
     #[serde(rename = "pane.set_droid_session")]
     PaneSetDroidSession(PaneSetDroidSessionParams),
+    #[serde(rename = "pane.set_pi_session")]
+    PaneSetPiSession(PaneSetPiSessionParams),
     #[serde(rename = "pane.close")]
     PaneClose(PaneTarget),
     #[serde(rename = "events.subscribe")]
@@ -300,6 +302,12 @@ pub struct PaneReleaseAgentParams {
 pub struct PaneSetDroidSessionParams {
     pub pane_id: String,
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSetPiSessionParams {
+    pub pane_id: String,
+    pub session_file: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

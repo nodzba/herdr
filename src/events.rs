@@ -44,6 +44,11 @@ pub enum AppEvent {
     },
     /// Droid reported a session ID change (SessionStart or SessionEnd hook).
     DroidSessionUpdate { pane_id: PaneId, session_id: String },
+    /// Pi reported its session file path change (session_start or session_shutdown).
+    PiSessionUpdate {
+        pane_id: PaneId,
+        session_file: String,
+    },
     /// A new version is available through the active installation manager.
     UpdateReady {
         version: String,

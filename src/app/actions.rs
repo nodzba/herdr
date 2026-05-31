@@ -843,6 +843,20 @@ impl AppState {
                 });
                 Vec::new()
             }
+            AppEvent::PiSessionUpdate {
+                pane_id,
+                session_file,
+            } => {
+                self.update_terminal_state(pane_id, |terminal| {
+                    if session_file.is_empty() {
+                        terminal.clear_pi_session_file();
+                    } else {
+                        terminal.set_pi_session_file(session_file.clone());
+                    }
+                    None
+                });
+                Vec::new()
+            }
             // Intercepted in App::handle_internal_event before reaching this
             // dispatch; never touches AppState.
             AppEvent::ClipboardWrite { .. } => Vec::new(),

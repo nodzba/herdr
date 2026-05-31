@@ -1,7 +1,7 @@
 // installed by herdr
 // safe to edit. this integration only activates inside herdr-managed panes.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=1
+// HERDR_INTEGRATION_VERSION=2
 // @ts-nocheck
 
 import { createConnection } from "node:net";
@@ -152,6 +152,17 @@ function releaseAgent(): Promise<void> {
   });
 }
 
+function setPiSession(sessionFile: string): Promise<void> {
+  return sendRequest({
+    id: `${source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+    method: "pane.set_pi_session",
+    params: {
+      pane_id: paneId,
+      session_file: sessionFile,
+    },
+  });
+}
+
 export default function (pi) {
   if (!enabled()) {
     return;
@@ -278,8 +289,22 @@ export default function (pi) {
     scheduleIdle();
   });
 
+  pi.on("session_start", async (_event, ctx) => {
+    // Report the active session file so herdr can resume it with
+    // `pi --session <path>` after a restart. Ephemeral sessions
+    // (--no-session) have no file, so we clear instead.
+    let sessionFile = "";
+    try {
+      sessionFile = ctx?.sessionManager?.getSessionFile?.() ?? "";
+    } catch {
+      sessionFile = "";
+    }
+    await setPiSession(sessionFile);
+  });
+
   pi.on("session_shutdown", async () => {
     clearPendingTimers();
+    await setPiSession("");
     await releaseAgent();
   });
 }

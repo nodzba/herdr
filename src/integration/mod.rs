@@ -12,7 +12,7 @@ use crate::layout::PaneId;
 pub(crate) const HERDR_PANE_ID_ENV_VAR: &str = "HERDR_PANE_ID";
 const PI_EXTENSION_INSTALL_NAME: &str = "herdr-agent-state.ts";
 const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/herdr-agent-state.ts");
-const PI_INTEGRATION_VERSION: u32 = 1;
+const PI_INTEGRATION_VERSION: u32 = 2;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 const CLAUDE_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/herdr-agent-state.sh");
